@@ -5,9 +5,12 @@ from __future__ import annotations
 import argparse
 import sqlite3
 import sys
+from datetime import datetime, timezone
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
+
+from db import connect_db, migrate_db
 
 
 USER_AGENT = "dialtoneapp.com crawler v0.0.1"
@@ -39,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_homepage_urls(db_path: str, limit: int | None) -> list[str]:
+def load_homepage_urls(conn: sqlite3.Connection, limit: int | None) -> list[str]:
     query = "select homepage_url from repositories where homepage_url > ''"
     params: tuple[int, ...] | tuple[()] = ()
 
@@ -47,12 +50,7 @@ def load_homepage_urls(db_path: str, limit: int | None) -> list[str]:
         query = f"{query} limit ?"
         params = (limit,)
 
-    conn = sqlite3.connect(db_path)
-    try:
-        rows = conn.execute(query, params).fetchall()
-    finally:
-        conn.close()
-
+    rows = conn.execute(query, params).fetchall()
     return [row[0] for row in rows]
 
 
@@ -67,7 +65,28 @@ def normalize_url(url: str) -> str:
     return url
 
 
-def fetch_homepage(url: str, timeout: float) -> tuple[bool, str]:
+def store_crawl(
+    conn: sqlite3.Connection,
+    homepage_url: str,
+    http_code: int | None,
+    response_bytes: int,
+) -> None:
+    with conn:
+        conn.execute(
+            """
+            INSERT INTO crawls (homepage_url, http_code, response_bytes, crawled_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                homepage_url,
+                http_code,
+                response_bytes,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+
+
+def fetch_homepage(url: str, timeout: float) -> tuple[bool, int | None, int, str]:
     normalized_url = normalize_url(url)
     request = Request(
         normalized_url,
@@ -77,17 +96,29 @@ def fetch_homepage(url: str, timeout: float) -> tuple[bool, str]:
 
     try:
         with urlopen(request, timeout=timeout) as response:
-            # Read a byte so we actually consume part of the response body.
-            response.read(1)
-            return True, f"{response.status} {response.geturl()}"
+            body = response.read()
+            response_bytes = len(body)
+            return (
+                True,
+                response.status,
+                response_bytes,
+                f"{response.status} {response.geturl()} ({response_bytes} bytes)",
+            )
     except HTTPError as exc:
+        body = b""
         try:
-            exc.read(1)
+            body = exc.read()
         except OSError:
             pass
-        return False, f"{exc.code} {exc.geturl()}"
+        response_bytes = len(body)
+        return (
+            False,
+            exc.code,
+            response_bytes,
+            f"{exc.code} {exc.geturl()} ({response_bytes} bytes)",
+        )
     except URLError as exc:
-        return False, f"ERROR {normalized_url} - {exc.reason}"
+        return False, None, 0, f"ERROR {normalized_url} - {exc.reason}"
 
 
 def main() -> int:
@@ -101,23 +132,33 @@ def main() -> int:
         print("--timeout must be > 0", file=sys.stderr)
         return 2
 
-    urls = load_homepage_urls(args.db, args.limit)
-    success_count = 0
-    failure_count = 0
+    conn = connect_db(args.db)
+    try:
+        migrate_db(conn)
+        urls = load_homepage_urls(conn, args.limit)
 
-    for url in urls:
-        try:
-            ok, message = fetch_homepage(url, args.timeout)
-        except ValueError as exc:
-            ok = False
-            message = f"ERROR {url} - {exc}"
+        success_count = 0
+        failure_count = 0
 
-        if ok:
-            success_count += 1
-            print(message, flush=True)
-        else:
-            failure_count += 1
-            print(message, file=sys.stderr, flush=True)
+        for url in urls:
+            try:
+                ok, http_code, response_bytes, message = fetch_homepage(url, args.timeout)
+            except ValueError as exc:
+                ok = False
+                http_code = None
+                response_bytes = 0
+                message = f"ERROR {url} - {exc}"
+
+            store_crawl(conn, url, http_code, response_bytes)
+
+            if ok:
+                success_count += 1
+                print(message, flush=True)
+            else:
+                failure_count += 1
+                print(message, file=sys.stderr, flush=True)
+    finally:
+        conn.close()
 
     print(
         (

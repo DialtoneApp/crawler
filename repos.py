@@ -13,6 +13,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from db import connect_db, migrate_db
+
 
 API_BASE_URL = "https://api.github.com"
 USER_AGENT = "repos.py"
@@ -139,57 +141,6 @@ def fetch_repository(full_name: str) -> dict[str, Any]:
     return github_get(f"/repos/{full_name}")
 
 
-def init_db(conn: sqlite3.Connection) -> None:
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS repositories (
-            full_name TEXT PRIMARY KEY,
-            owner_login TEXT NOT NULL,
-            name TEXT NOT NULL,
-            html_url TEXT NOT NULL,
-            description TEXT,
-            homepage_url TEXT,
-            stars INTEGER NOT NULL,
-            forks INTEGER NOT NULL,
-            open_issues INTEGER NOT NULL,
-            watchers INTEGER NOT NULL,
-            language TEXT,
-            default_branch TEXT,
-            created_at TEXT,
-            updated_at TEXT,
-            pushed_at TEXT,
-            archived INTEGER NOT NULL,
-            is_fork INTEGER NOT NULL,
-            search_rank INTEGER NOT NULL,
-            fetched_at TEXT NOT NULL
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS repository_topics (
-            full_name TEXT NOT NULL,
-            topic TEXT NOT NULL,
-            PRIMARY KEY (full_name, topic),
-            FOREIGN KEY (full_name) REFERENCES repositories(full_name) ON DELETE CASCADE
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_repositories_search_rank
-        ON repositories(search_rank)
-        """
-    )
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_repository_topics_topic
-        ON repository_topics(topic)
-        """
-    )
-
-
 def upsert_repository(
     conn: sqlite3.Connection,
     repo: dict[str, Any],
@@ -292,9 +243,9 @@ def main() -> int:
     repositories = search_repositories(args.days, args.limit)
     fetched_at = datetime.now(timezone.utc).isoformat()
 
-    conn = sqlite3.connect(args.db)
+    conn = connect_db(args.db)
     try:
-        init_db(conn)
+        migrate_db(conn)
 
         for index, repo_summary in enumerate(repositories, start=1):
             repo = fetch_repository(repo_summary["full_name"])
