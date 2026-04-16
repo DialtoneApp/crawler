@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sqlite3
 import sys
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
@@ -13,18 +12,19 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from db import connect_db, migrate_db
 
-
-API_BASE_URL = "https://api.github.com"
+GITHUB_API_BASE_URL = "https://api.github.com"
+APP_API_BASE_URL = os.getenv("DIALTONE_API_BASE_URL", "http://localhost:5173")
+APP_API_TIMEOUT = 30.0
 USER_AGENT = "repos.py"
+APP_USER_AGENT = "dialtoneapp repo sync v0.0.1"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Find the most-starred GitHub repositories created recently, "
-            "fetch repository metadata, and store the results in SQLite."
+            "fetch repository metadata, and POST the results to dialtoneapp."
         )
     )
     parser.add_argument(
@@ -40,9 +40,9 @@ def parse_args() -> argparse.Namespace:
         help="Maximum number of repositories to fetch. Default: 30.",
     )
     parser.add_argument(
-        "--db",
-        default="repos.db",
-        help="SQLite database path. Default: repos.db.",
+        "--api-base-url",
+        default=APP_API_BASE_URL,
+        help=f"Dialtone API base URL. Default: {APP_API_BASE_URL}.",
     )
     return parser.parse_args()
 
@@ -74,7 +74,7 @@ def format_rate_limit_reset(value: str | None) -> str | None:
 
 
 def github_get(path: str, params: dict[str, str] | None = None) -> dict[str, Any]:
-    url = f"{API_BASE_URL}{path}"
+    url = f"{GITHUB_API_BASE_URL}{path}"
     if params:
         url = f"{url}?{urlencode(params)}"
 
@@ -104,6 +104,52 @@ def github_get(path: str, params: dict[str, str] | None = None) -> dict[str, Any
         ) from exc
     except URLError as exc:
         raise SystemExit(f"GitHub API request failed: {exc.reason}") from exc
+
+
+def app_request(
+    api_base_url: str,
+    path: str,
+    *,
+    method: str = "GET",
+    payload: dict[str, Any] | None = None,
+    params: dict[str, str | int] | None = None,
+) -> Any:
+    base_url = api_base_url.rstrip("/")
+    url = f"{base_url}{path}"
+    if params:
+        encoded = urlencode({key: value for key, value in params.items() if value is not None})
+        if encoded:
+            url = f"{url}?{encoded}"
+
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": APP_USER_AGENT,
+    }
+    body: bytes | None = None
+
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+        body = json.dumps(payload).encode("utf-8")
+
+    request = Request(url, headers=headers, data=body, method=method)
+
+    try:
+        with urlopen(request, timeout=APP_API_TIMEOUT) as response:
+            raw = response.read()
+    except HTTPError as exc:
+        details = exc.read().decode("utf-8", errors="replace").strip()
+        message = details or exc.reason
+        raise SystemExit(f"Dialtone API request failed ({exc.code}): {message}") from exc
+    except URLError as exc:
+        raise SystemExit(f"Dialtone API request failed: {exc.reason}") from exc
+
+    if not raw:
+        return None
+
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"Dialtone API returned invalid JSON for {path}") from exc
 
 
 def search_repositories(days: int, limit: int) -> list[dict[str, Any]]:
@@ -141,92 +187,22 @@ def fetch_repository(full_name: str) -> dict[str, Any]:
     return github_get(f"/repos/{full_name}")
 
 
-def upsert_repository(
-    conn: sqlite3.Connection,
+def sync_repository(
+    api_base_url: str,
     repo: dict[str, Any],
     search_rank: int,
     fetched_at: str,
 ) -> None:
-    owner = repo.get("owner") or {}
-    topics = repo.get("topics") or []
-
-    with conn:
-        conn.execute(
-            """
-            INSERT INTO repositories (
-                full_name,
-                owner_login,
-                name,
-                html_url,
-                description,
-                homepage_url,
-                stars,
-                forks,
-                open_issues,
-                watchers,
-                language,
-                default_branch,
-                created_at,
-                updated_at,
-                pushed_at,
-                archived,
-                is_fork,
-                search_rank,
-                fetched_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(full_name) DO UPDATE SET
-                owner_login = excluded.owner_login,
-                name = excluded.name,
-                html_url = excluded.html_url,
-                description = excluded.description,
-                homepage_url = excluded.homepage_url,
-                stars = excluded.stars,
-                forks = excluded.forks,
-                open_issues = excluded.open_issues,
-                watchers = excluded.watchers,
-                language = excluded.language,
-                default_branch = excluded.default_branch,
-                created_at = excluded.created_at,
-                updated_at = excluded.updated_at,
-                pushed_at = excluded.pushed_at,
-                archived = excluded.archived,
-                is_fork = excluded.is_fork,
-                search_rank = excluded.search_rank,
-                fetched_at = excluded.fetched_at
-            """,
-            (
-                repo["full_name"],
-                owner.get("login", ""),
-                repo["name"],
-                repo["html_url"],
-                repo.get("description"),
-                repo.get("homepage"),
-                repo["stargazers_count"],
-                repo["forks_count"],
-                repo["open_issues_count"],
-                repo["watchers_count"],
-                repo.get("language"),
-                repo.get("default_branch"),
-                repo.get("created_at"),
-                repo.get("updated_at"),
-                repo.get("pushed_at"),
-                int(bool(repo.get("archived"))),
-                int(bool(repo.get("fork"))),
-                search_rank,
-                fetched_at,
-            ),
-        )
-        conn.execute(
-            "DELETE FROM repository_topics WHERE full_name = ?",
-            (repo["full_name"],),
-        )
-        conn.executemany(
-            """
-            INSERT INTO repository_topics (full_name, topic)
-            VALUES (?, ?)
-            """,
-            ((repo["full_name"], topic) for topic in topics),
-        )
+    app_request(
+        api_base_url,
+        "/api/v1/crawler/repositories",
+        method="POST",
+        payload={
+            "repo": repo,
+            "search_rank": search_rank,
+            "fetched_at": fetched_at,
+        },
+    )
 
 
 def main() -> int:
@@ -243,22 +219,16 @@ def main() -> int:
     repositories = search_repositories(args.days, args.limit)
     fetched_at = datetime.now(timezone.utc).isoformat()
 
-    conn = connect_db(args.db)
-    try:
-        migrate_db(conn)
-
-        for index, repo_summary in enumerate(repositories, start=1):
-            repo = fetch_repository(repo_summary["full_name"])
-            upsert_repository(conn, repo, index, fetched_at)
-            print(
-                f'{repo["full_name"]} ({repo["stargazers_count"]}⭐) - {repo["html_url"]}',
-                flush=True,
-            )
-    finally:
-        conn.close()
+    for index, repo_summary in enumerate(repositories, start=1):
+        repo = fetch_repository(repo_summary["full_name"])
+        sync_repository(args.api_base_url, repo, index, fetched_at)
+        print(
+            f'{repo["full_name"]} ({repo["stargazers_count"]}⭐) - {repo["html_url"]}',
+            flush=True,
+        )
 
     print(
-        f"Saved {len(repositories)} repositories to {args.db}",
+        f"Saved {len(repositories)} repositories to {args.api_base_url.rstrip('/')}",
         file=sys.stderr,
     )
     return 0

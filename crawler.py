@@ -4,22 +4,22 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
-import sqlite3
 import sys
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from html.parser import HTMLParser
+from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.parse import urlencode, urljoin, urlparse, urlunparse
 from urllib.request import Request, urlopen
 from urllib.robotparser import RobotFileParser
 
-from db import connect_db, migrate_db
-
-
 USER_AGENT = "dialtoneapp.com crawler v0.0.1"
+APP_API_BASE_URL = os.getenv("DIALTONE_API_BASE_URL", "http://localhost:5173")
+APP_API_TIMEOUT = 30.0
 HTML_CONTENT_TYPES = ("text/html", "application/xhtml+xml")
 BINARY_SUFFIXES = {
     ".7z",
@@ -212,17 +212,63 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def app_request(
+    api_base_url: str,
+    path: str,
+    *,
+    method: str = "GET",
+    payload: dict | list | None = None,
+    params: dict[str, str | int] | None = None,
+) -> Any:
+    base_url = api_base_url.rstrip("/")
+    url = f"{base_url}{path}"
+    if params:
+        encoded = urlencode({key: value for key, value in params.items() if value is not None})
+        if encoded:
+            url = f"{url}?{encoded}"
+
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+    body: bytes | None = None
+
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+        body = json.dumps(payload).encode("utf-8")
+
+    request = Request(url, headers=headers, data=body, method=method)
+
+    try:
+        with urlopen(request, timeout=APP_API_TIMEOUT) as response:
+            raw = response.read()
+    except HTTPError as exc:
+        details = exc.read().decode("utf-8", errors="replace").strip()
+        message = details or exc.reason
+        raise RuntimeError(f"Dialtone API request failed ({exc.code}) for {path}: {message}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"Dialtone API request failed for {path}: {exc.reason}") from exc
+
+    if not raw:
+        return None
+
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Dialtone API returned invalid JSON for {path}") from exc
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Fetch homepage URLs from the repositories table, inspect crawler and "
-            "LLM-facing site files, and store compact crawl summaries in SQLite."
+            "Fetch homepage URLs from dialtoneapp, inspect crawler and "
+            "LLM-facing site files, and POST compact crawl summaries back to the app."
         )
     )
     parser.add_argument(
-        "--db",
-        default="repos.db",
-        help="SQLite database path. Default: repos.db.",
+        "--api-base-url",
+        default=APP_API_BASE_URL,
+        help=f"Dialtone API base URL. Default: {APP_API_BASE_URL}.",
     )
     parser.add_argument(
         "--limit",
@@ -251,22 +297,32 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_homepages(
-    conn: sqlite3.Connection,
+    api_base_url: str,
     limit: int | None,
 ) -> list[tuple[str, str]]:
-    query = """
-        SELECT full_name, homepage_url
-        FROM repositories
-        WHERE homepage_url > ''
-        ORDER BY search_rank
-    """
-    params: tuple[int, ...] | tuple[()] = ()
-
+    params: dict[str, str | int] | None = None
     if limit is not None:
-        query = f"{query} LIMIT ?"
-        params = (limit,)
+        params = {"limit": limit}
 
-    return conn.execute(query, params).fetchall()
+    payload = app_request(
+        api_base_url,
+        "/api/v1/crawler/repositories/homepages",
+        params=params,
+    )
+
+    if not isinstance(payload, list):
+        raise RuntimeError("Dialtone API returned an invalid homepage list")
+
+    rows: list[tuple[str, str]] = []
+    for row in payload:
+        if not isinstance(row, dict):
+            continue
+        full_name = row.get("full_name")
+        homepage_url = row.get("homepage_url")
+        if isinstance(full_name, str) and isinstance(homepage_url, str):
+            rows.append((full_name, homepage_url))
+
+    return rows
 
 
 def normalize_url(url: str) -> str:
@@ -630,37 +686,34 @@ def blocked_page(url: str, referrer_url: str | None, depth: int) -> PageSummary:
 
 
 def create_crawl_run(
-    conn: sqlite3.Connection,
+    api_base_url: str,
     repository_full_name: str,
     homepage_url: str,
     site_origin: str,
 ) -> int:
-    with conn:
-        cursor = conn.execute(
-            """
-            INSERT INTO crawl_runs (
-                repository_full_name,
-                homepage_url,
-                site_origin,
-                user_agent,
-                status,
-                started_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                repository_full_name,
-                homepage_url,
-                site_origin,
-                USER_AGENT,
-                "running",
-                utc_now(),
-            ),
-        )
-    return int(cursor.lastrowid)
+    payload = app_request(
+        api_base_url,
+        "/api/v1/crawler/crawl-runs",
+        method="POST",
+        payload={
+            "repository_full_name": repository_full_name,
+            "homepage_url": homepage_url,
+            "site_origin": site_origin,
+            "user_agent": USER_AGENT,
+            "status": "running",
+            "started_at": utc_now(),
+        },
+    )
+
+    crawl_run_id = payload.get("id") if isinstance(payload, dict) else None
+    if not isinstance(crawl_run_id, int):
+        raise RuntimeError("Dialtone API did not return a crawl run id")
+
+    return crawl_run_id
 
 
 def finalize_crawl_run(
-    conn: sqlite3.Connection,
+    api_base_url: str,
     crawl_run_id: int,
     *,
     site_origin: str,
@@ -685,245 +738,123 @@ def finalize_crawl_run(
     status: str = "completed",
     failure_reason: str | None = None,
 ) -> None:
-    with conn:
-        conn.execute(
-            """
-            UPDATE crawl_runs
-            SET site_origin = ?,
-                status = ?,
-                failure_reason = ?,
-                completed_at = ?,
-                homepage_final_url = ?,
-                homepage_http_code = ?,
-                homepage_response_bytes = ?,
-                robots_txt_present = ?,
-                llms_txt_present = ?,
-                llm_txt_present = ?,
-                agents_json_present = ?,
-                pages_discovered = ?,
-                pages_crawled = ?,
-                pages_blocked = ?,
-                html_pages = ?,
-                pages_with_title = ?,
-                pages_with_meta_description = ?,
-                pages_with_canonical = ?,
-                pages_with_json_ld = ?,
-                pages_with_open_graph = ?,
-                pages_with_twitter_card = ?,
-                findings_count = ?
-            WHERE id = ?
-            """,
-            (
-                site_origin,
-                status,
-                failure_reason,
-                utc_now(),
-                homepage_final_url,
-                homepage_http_code,
-                homepage_response_bytes,
-                int(robots_txt_present),
-                int(llms_txt_present),
-                int(llm_txt_present),
-                int(agents_json_present),
-                pages_discovered,
-                pages_crawled,
-                pages_blocked,
-                html_pages,
-                pages_with_title,
-                pages_with_meta_description,
-                pages_with_canonical,
-                pages_with_json_ld,
-                pages_with_open_graph,
-                pages_with_twitter_card,
-                findings_count,
-                crawl_run_id,
-            ),
-        )
+    app_request(
+        api_base_url,
+        f"/api/v1/crawler/crawl-runs/{crawl_run_id}/finalize",
+        method="POST",
+        payload={
+            "site_origin": site_origin,
+            "status": status,
+            "failure_reason": failure_reason,
+            "completed_at": utc_now(),
+            "homepage_final_url": homepage_final_url,
+            "homepage_http_code": homepage_http_code,
+            "homepage_response_bytes": homepage_response_bytes,
+            "robots_txt_present": robots_txt_present,
+            "llms_txt_present": llms_txt_present,
+            "llm_txt_present": llm_txt_present,
+            "agents_json_present": agents_json_present,
+            "pages_discovered": pages_discovered,
+            "pages_crawled": pages_crawled,
+            "pages_blocked": pages_blocked,
+            "html_pages": html_pages,
+            "pages_with_title": pages_with_title,
+            "pages_with_meta_description": pages_with_meta_description,
+            "pages_with_canonical": pages_with_canonical,
+            "pages_with_json_ld": pages_with_json_ld,
+            "pages_with_open_graph": pages_with_open_graph,
+            "pages_with_twitter_card": pages_with_twitter_card,
+            "findings_count": findings_count,
+        },
+    )
 
 
 def fail_crawl_run(
-    conn: sqlite3.Connection,
+    api_base_url: str,
     crawl_run_id: int,
     site_origin: str,
     failure_reason: str,
 ) -> None:
-    finalize_crawl_run(
-        conn,
-        crawl_run_id,
-        site_origin=site_origin,
-        homepage_final_url=None,
-        homepage_http_code=None,
-        homepage_response_bytes=0,
-        robots_txt_present=False,
-        llms_txt_present=False,
-        llm_txt_present=False,
-        agents_json_present=False,
-        pages_discovered=0,
-        pages_crawled=0,
-        pages_blocked=0,
-        html_pages=0,
-        pages_with_title=0,
-        pages_with_meta_description=0,
-        pages_with_canonical=0,
-        pages_with_json_ld=0,
-        pages_with_open_graph=0,
-        pages_with_twitter_card=0,
-        findings_count=0,
-        status="failed",
-        failure_reason=failure_reason[:500],
+    app_request(
+        api_base_url,
+        f"/api/v1/crawler/crawl-runs/{crawl_run_id}/fail",
+        method="POST",
+        payload={
+            "site_origin": site_origin,
+            "failure_reason": failure_reason[:500],
+        },
     )
 
 
 def store_legacy_crawl(
-    conn: sqlite3.Connection,
+    api_base_url: str,
     homepage_url: str,
     http_code: int | None,
     response_bytes: int,
 ) -> None:
-    with conn:
-        conn.execute(
-            """
-            INSERT INTO crawls (homepage_url, http_code, response_bytes, crawled_at)
-            VALUES (?, ?, ?, ?)
-            """,
-            (homepage_url, http_code, response_bytes, utc_now()),
-        )
+    app_request(
+        api_base_url,
+        "/api/v1/crawler/crawls",
+        method="POST",
+        payload={
+            "homepage_url": homepage_url,
+            "http_code": http_code,
+            "response_bytes": response_bytes,
+            "crawled_at": utc_now(),
+        },
+    )
 
 
 def store_asset(
-    conn: sqlite3.Connection,
+    api_base_url: str,
     crawl_run_id: int,
     asset: AssetSummary,
 ) -> None:
-    with conn:
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO crawl_assets (
-                crawl_run_id,
-                asset_type,
-                asset_url,
-                http_code,
-                response_bytes,
-                content_type,
-                is_present,
-                parsed_ok,
-                item_count,
-                fetched_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                crawl_run_id,
-                asset.asset_type,
-                asset.asset_url,
-                asset.http_code,
-                asset.response_bytes,
-                asset.content_type,
-                int(asset.is_present),
-                int(asset.parsed_ok),
-                asset.item_count,
-                utc_now(),
-            ),
-        )
+    payload = asdict(asset)
+    payload["crawl_run_id"] = crawl_run_id
+    payload["fetched_at"] = utc_now()
+    app_request(
+        api_base_url,
+        "/api/v1/crawler/crawl-assets",
+        method="POST",
+        payload=payload,
+    )
 
 
 def store_page(
-    conn: sqlite3.Connection,
+    api_base_url: str,
     crawl_run_id: int,
     page: PageSummary,
 ) -> None:
-    with conn:
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO crawl_pages (
-                crawl_run_id,
-                url,
-                final_url,
-                referrer_url,
-                depth,
-                allowed_by_robots,
-                http_code,
-                response_bytes,
-                content_type,
-                is_html,
-                title,
-                meta_description_length,
-                canonical_url,
-                meta_robots,
-                x_robots_tag,
-                h1_count,
-                word_count,
-                internal_link_count,
-                external_link_count,
-                has_json_ld,
-                has_open_graph,
-                has_twitter_card,
-                fetched_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                crawl_run_id,
-                page.url,
-                page.final_url,
-                page.referrer_url,
-                page.depth,
-                int(page.allowed_by_robots),
-                page.http_code,
-                page.response_bytes,
-                page.content_type,
-                int(page.is_html),
-                page.title,
-                page.meta_description_length,
-                page.canonical_url,
-                page.meta_robots,
-                page.x_robots_tag,
-                page.h1_count,
-                page.word_count,
-                page.internal_link_count,
-                page.external_link_count,
-                int(page.has_json_ld),
-                int(page.has_open_graph),
-                int(page.has_twitter_card),
-                utc_now(),
-            ),
-        )
+    payload = asdict(page)
+    payload["crawl_run_id"] = crawl_run_id
+    payload["fetched_at"] = utc_now()
+    app_request(
+        api_base_url,
+        "/api/v1/crawler/crawl-pages",
+        method="POST",
+        payload=payload,
+    )
 
 
 def store_findings(
-    conn: sqlite3.Connection,
+    api_base_url: str,
     crawl_run_id: int,
     findings: list[Finding],
 ) -> None:
     if not findings:
         return
 
-    with conn:
-        conn.executemany(
-            """
-            INSERT INTO crawl_findings (
-                crawl_run_id,
-                category,
-                code,
-                severity,
-                page_url,
-                metric_value,
-                message,
-                created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                (
-                    crawl_run_id,
-                    finding.category,
-                    finding.code,
-                    finding.severity,
-                    finding.page_url,
-                    finding.metric_value,
-                    finding.message,
-                    utc_now(),
-                )
-                for finding in findings
-            ],
-        )
+    payload = {
+        "crawl_run_id": crawl_run_id,
+        "findings": [asdict(finding) for finding in findings],
+    }
+    app_request(
+        api_base_url,
+        "/api/v1/crawler/crawl-findings",
+        method="POST",
+        payload=payload,
+    )
 
 
 def build_findings(
@@ -1075,7 +1006,7 @@ def build_findings(
 
 
 def crawl_site(
-    conn: sqlite3.Connection,
+    api_base_url: str,
     repository_full_name: str,
     homepage_url: str,
     timeout: float,
@@ -1085,7 +1016,7 @@ def crawl_site(
     normalized_homepage = normalize_url(homepage_url)
     initial_origin = origin_from_url(normalized_homepage)
     crawl_run_id = create_crawl_run(
-        conn,
+        api_base_url,
         repository_full_name=repository_full_name,
         homepage_url=normalized_homepage,
         site_origin=initial_origin,
@@ -1100,31 +1031,31 @@ def crawl_site(
     try:
         robots = parse_robots(initial_origin, timeout)
         assets.append(robots.asset)
-        store_asset(conn, crawl_run_id, robots.asset)
+        store_asset(api_base_url, crawl_run_id, robots.asset)
 
         if robots.can_fetch(normalized_homepage):
             homepage_result = fetch_url(normalized_homepage, timeout)
             store_legacy_crawl(
-                conn,
+                api_base_url,
                 homepage_url=normalized_homepage,
                 http_code=homepage_result.http_code,
                 response_bytes=homepage_result.response_bytes,
             )
             homepage_page, homepage_links = summarize_page(homepage_result, None, 0)
             pages.append(homepage_page)
-            store_page(conn, crawl_run_id, homepage_page)
+            store_page(api_base_url, crawl_run_id, homepage_page)
 
             active_origin = origin_from_url(homepage_page.final_url or normalized_homepage)
             if active_origin != initial_origin:
                 robots = parse_robots(active_origin, timeout)
                 assets.append(robots.asset)
-                store_asset(conn, crawl_run_id, robots.asset)
+                store_asset(api_base_url, crawl_run_id, robots.asset)
         else:
             blocked = blocked_page(normalized_homepage, None, 0)
             pages.append(blocked)
-            store_page(conn, crawl_run_id, blocked)
+            store_page(api_base_url, crawl_run_id, blocked)
             store_legacy_crawl(
-                conn,
+                api_base_url,
                 homepage_url=normalized_homepage,
                 http_code=None,
                 response_bytes=0,
@@ -1134,7 +1065,7 @@ def crawl_site(
         for asset_type, asset_path in SPECIAL_ASSETS:
             asset = analyze_special_asset(asset_type, urljoin(active_origin + "/", asset_path.lstrip("/")), timeout)
             assets.append(asset)
-            store_asset(conn, crawl_run_id, asset)
+            store_asset(api_base_url, crawl_run_id, asset)
 
         queue: deque[tuple[str, str | None, int]] = deque()
         queued_urls: set[str] = set()
@@ -1160,13 +1091,13 @@ def crawl_site(
             if not robots.can_fetch(url):
                 blocked = blocked_page(url, referrer_url, depth)
                 pages.append(blocked)
-                store_page(conn, crawl_run_id, blocked)
+                store_page(api_base_url, crawl_run_id, blocked)
                 continue
 
             result = fetch_url(url, timeout)
             page, links = summarize_page(result, referrer_url, depth)
             pages.append(page)
-            store_page(conn, crawl_run_id, page)
+            store_page(api_base_url, crawl_run_id, page)
             fetched_pages += 1
 
             if (
@@ -1183,7 +1114,7 @@ def crawl_site(
                     queued_urls.add(link)
 
         findings = build_findings(assets, pages)
-        store_findings(conn, crawl_run_id, findings)
+        store_findings(api_base_url, crawl_run_id, findings)
 
         html_pages = [page for page in pages if page.is_html]
         agents_present = any(
@@ -1192,7 +1123,7 @@ def crawl_site(
             if asset.asset_type in {"agents_json", "well_known_agents_json"}
         )
         finalize_crawl_run(
-            conn,
+            api_base_url,
             crawl_run_id,
             site_origin=active_origin,
             homepage_final_url=pages[0].final_url if pages else None,
@@ -1240,7 +1171,7 @@ def crawl_site(
             ),
         )
     except Exception as exc:
-        fail_crawl_run(conn, crawl_run_id, site_origin=active_origin, failure_reason=str(exc))
+        fail_crawl_run(api_base_url, crawl_run_id, site_origin=active_origin, failure_reason=str(exc))
         raise
 
 
@@ -1263,43 +1194,38 @@ def main() -> int:
         print("--max-depth must be >= 0", file=sys.stderr)
         return 2
 
-    conn = connect_db(args.db)
-    try:
-        migrate_db(conn)
-        rows = load_homepages(conn, args.limit)
+    rows = load_homepages(args.api_base_url, args.limit)
 
-        success_count = 0
-        failure_count = 0
+    success_count = 0
+    failure_count = 0
 
-        for repository_full_name, homepage_url in rows:
-            try:
-                ok, message = crawl_site(
-                    conn,
-                    repository_full_name=repository_full_name,
-                    homepage_url=homepage_url,
-                    timeout=args.timeout,
-                    max_pages=args.max_pages,
-                    max_depth=args.max_depth,
-                )
-            except ValueError as exc:
-                ok = False
-                message = f"{homepage_url} - {exc}"
-            except Exception as exc:
-                ok = False
-                message = f"{homepage_url} - crawl failed: {exc}"
+    for repository_full_name, homepage_url in rows:
+        try:
+            ok, message = crawl_site(
+                args.api_base_url,
+                repository_full_name=repository_full_name,
+                homepage_url=homepage_url,
+                timeout=args.timeout,
+                max_pages=args.max_pages,
+                max_depth=args.max_depth,
+            )
+        except ValueError as exc:
+            ok = False
+            message = f"{homepage_url} - {exc}"
+        except Exception as exc:
+            ok = False
+            message = f"{homepage_url} - crawl failed: {exc}"
 
-            if ok:
-                success_count += 1
-                print(message, flush=True)
-            else:
-                failure_count += 1
-                print(message, file=sys.stderr, flush=True)
-    finally:
-        conn.close()
+        if ok:
+            success_count += 1
+            print(message, flush=True)
+        else:
+            failure_count += 1
+            print(message, file=sys.stderr, flush=True)
 
     print(
         (
-            f"Crawled {len(rows)} sites from {args.db} "
+            f"Crawled {len(rows)} sites via {args.api_base_url.rstrip('/')} "
             f"({success_count} succeeded, {failure_count} failed)"
         ),
         file=sys.stderr,
