@@ -24,7 +24,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Find the most-starred GitHub repositories created recently, "
-            "fetch repository metadata, and POST the results to dialtoneapp."
+            "fetch repository metadata one page at a time, and POST the "
+            "results to dialtoneapp until interrupted."
         )
     )
     parser.add_argument(
@@ -34,10 +35,15 @@ def parse_args() -> argparse.Namespace:
         help="Only include repositories created within the last N days. Default: 7.",
     )
     parser.add_argument(
+        "--page-size",
         "--limit",
+        dest="page_size",
         type=int,
         default=30,
-        help="Maximum number of repositories to fetch. Default: 30.",
+        help=(
+            "Number of repositories to fetch per GitHub search page. "
+            "Default: 30. Maximum: 100."
+        ),
     )
     parser.add_argument(
         "--api-base-url",
@@ -152,35 +158,28 @@ def app_request(
         raise SystemExit(f"Dialtone API returned invalid JSON for {path}") from exc
 
 
-def search_repositories(days: int, limit: int) -> list[dict[str, Any]]:
+def search_repositories_page(
+    days: int,
+    page: int,
+    page_size: int,
+) -> list[dict[str, Any]]:
     created_after = (date.today() - timedelta(days=days)).isoformat()
-    repositories: list[dict[str, Any]] = []
-    page = 1
+    payload = github_get(
+        "/search/repositories",
+        {
+            "q": f"created:>{created_after}",
+            "sort": "stars",
+            "order": "desc",
+            "per_page": str(page_size),
+            "page": str(page),
+        },
+    )
 
-    while len(repositories) < limit:
-        page_size = min(100, limit - len(repositories))
-        payload = github_get(
-            "/search/repositories",
-            {
-                "q": f"created:>{created_after}",
-                "sort": "stars",
-                "order": "desc",
-                "per_page": str(page_size),
-                "page": str(page),
-            },
-        )
+    items = payload.get("items", [])
+    if not isinstance(items, list):
+        raise SystemExit("GitHub API returned an invalid repository list")
 
-        items = payload.get("items", [])
-        if not items:
-            break
-
-        repositories.extend(items)
-        if len(items) < page_size:
-            break
-
-        page += 1
-
-    return repositories[:limit]
+    return items
 
 
 def fetch_repository(full_name: str) -> dict[str, Any]:
@@ -212,23 +211,74 @@ def main() -> int:
         print("--days must be >= 0", file=sys.stderr)
         return 2
 
-    if args.limit <= 0:
-        print("--limit must be > 0", file=sys.stderr)
+    if args.page_size <= 0:
+        print("--page-size must be > 0", file=sys.stderr)
         return 2
 
-    repositories = search_repositories(args.days, args.limit)
-    fetched_at = datetime.now(timezone.utc).isoformat()
+    if args.page_size > 100:
+        print("--page-size must be <= 100", file=sys.stderr)
+        return 2
 
-    for index, repo_summary in enumerate(repositories, start=1):
-        repo = fetch_repository(repo_summary["full_name"])
-        sync_repository(args.api_base_url, repo, index, fetched_at)
+    page = 1
+    synced_count = 0
+
+    try:
+        while True:
+            print(f"Loading GitHub search page {page}...", file=sys.stderr, flush=True)
+            repositories = search_repositories_page(args.days, page, args.page_size)
+            if not repositories:
+                print(
+                    f"No repositories returned for page {page}; stopping.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                break
+
+            for repo_summary in repositories:
+                repo = fetch_repository(repo_summary["full_name"])
+                synced_count += 1
+                sync_repository(
+                    args.api_base_url,
+                    repo,
+                    synced_count,
+                    datetime.now(timezone.utc).isoformat(),
+                )
+                print(
+                    f'{repo["full_name"]} ({repo["stargazers_count"]}⭐) - {repo["html_url"]}',
+                    flush=True,
+                )
+
+            print(
+                (
+                    f"Synced page {page} "
+                    f"({len(repositories)} repositories, total={synced_count})"
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
+
+            if len(repositories) < args.page_size:
+                print(
+                    f"GitHub returned a partial page at page {page}; stopping.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                break
+
+            page += 1
+    except KeyboardInterrupt:
         print(
-            f'{repo["full_name"]} ({repo["stargazers_count"]}⭐) - {repo["html_url"]}',
+            (
+                f"\nStopped by user after syncing {synced_count} repositories "
+                f"through page {page}."
+            ),
+            file=sys.stderr,
             flush=True,
         )
+        return 130
 
     print(
-        f"Saved {len(repositories)} repositories to {args.api_base_url.rstrip('/')}",
+        f"Saved {synced_count} repositories to {args.api_base_url.rstrip('/')}",
         file=sys.stderr,
     )
     return 0
