@@ -73,6 +73,9 @@ def bootstrap_legacy_schema(conn: sqlite3.Connection) -> None:
     if "crawls" in tables:
         record_migration(conn, "002", "crawls")
 
+    if {"crawl_runs", "crawl_assets", "crawl_pages", "crawl_findings"}.issubset(tables):
+        record_migration(conn, "003", "site_crawl_models")
+
 
 def record_migration(conn: sqlite3.Connection, version: str, name: str) -> None:
     conn.execute(
