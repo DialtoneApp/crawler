@@ -114,6 +114,7 @@ class PageSummary:
     title: str | None
     meta_description_length: int | None
     canonical_url: str | None
+    favicon_url: str | None
     meta_robots: str | None
     x_robots_tag: str | None
     h1_count: int
@@ -135,10 +136,23 @@ class Finding:
     message: str
 
 
+def favicon_rel_priority(rel_parts: set[str]) -> int | None:
+    if "icon" in rel_parts:
+        return 0 if "shortcut" not in rel_parts else 1
+    if any(part.startswith("apple-touch-icon") for part in rel_parts):
+        return 2
+    if "mask-icon" in rel_parts:
+        return 3
+    if "fluid-icon" in rel_parts:
+        return 4
+    return None
+
+
 class PageParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.hrefs: list[str] = []
+        self.favicon_hrefs: list[tuple[int, str]] = []
         self.title_parts: list[str] = []
         self.text_parts: list[str] = []
         self.meta_description: str | None = None
@@ -171,6 +185,10 @@ class PageParser(HTMLParser):
             href = attr_map.get("href")
             if "canonical" in rel and href:
                 self.canonical_href = href.strip()
+            if href:
+                priority = favicon_rel_priority(rel)
+                if priority is not None:
+                    self.favicon_hrefs.append((priority, href.strip()))
         elif lower_tag == "meta":
             name = (attr_map.get("name") or "").strip().lower()
             prop = (attr_map.get("property") or "").strip().lower()
@@ -373,6 +391,39 @@ def decode_body(body: bytes, content_type: str | None) -> str:
         return body.decode("utf-8", errors="replace")
 
 
+def resolve_url(base_url: str, href: str) -> str | None:
+    absolute = urljoin(base_url, href.strip())
+    parsed = urlparse(absolute)
+
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+
+    path = parsed.path or "/"
+    return urlunparse(
+        (
+            parsed.scheme.lower(),
+            parsed.netloc.lower(),
+            path,
+            "",
+            parsed.query,
+            "",
+        )
+    )
+
+
+def extract_favicon_url(page_url: str, parser: PageParser) -> str | None:
+    for _, href in sorted(parser.favicon_hrefs, key=lambda item: item[0]):
+        resolved = resolve_url(page_url, href)
+        if resolved:
+            return resolved
+
+    origin = origin_from_url(page_url)
+    if not origin:
+        return None
+
+    return resolve_url(origin + "/", "/favicon.ico")
+
+
 def is_html_response(result: FetchResult) -> bool:
     base = content_type_base(result.content_type)
     return bool(base and base in HTML_CONTENT_TYPES)
@@ -563,6 +614,7 @@ def summarize_page(
                 title=None,
                 meta_description_length=None,
                 canonical_url=None,
+                favicon_url=None,
                 meta_robots=None,
                 x_robots_tag=None,
                 h1_count=0,
@@ -591,6 +643,7 @@ def summarize_page(
                 title=None,
                 meta_description_length=None,
                 canonical_url=None,
+                favicon_url=None,
                 meta_robots=None,
                 x_robots_tag=result.x_robots_tag,
                 h1_count=0,
@@ -627,6 +680,7 @@ def summarize_page(
     if parser.canonical_href:
         canonical_url = urljoin(final_url, parser.canonical_href.strip())
 
+    favicon_url = extract_favicon_url(final_url, parser)
     word_count = len(re.findall(r"\b[\w'-]+\b", " ".join(parser.text_parts)))
     title = " ".join(part.strip() for part in parser.title_parts if part.strip()) or None
     meta_description_length = None
@@ -646,6 +700,7 @@ def summarize_page(
         title=title,
         meta_description_length=meta_description_length,
         canonical_url=canonical_url,
+        favicon_url=favicon_url,
         meta_robots=parser.meta_robots,
         x_robots_tag=result.x_robots_tag,
         h1_count=parser.h1_count,
@@ -673,6 +728,7 @@ def blocked_page(url: str, referrer_url: str | None, depth: int) -> PageSummary:
         title=None,
         meta_description_length=None,
         canonical_url=None,
+        favicon_url=None,
         meta_robots=None,
         x_robots_tag=None,
         h1_count=0,
@@ -791,6 +847,7 @@ def store_legacy_crawl(
     homepage_url: str,
     http_code: int | None,
     response_bytes: int,
+    favicon_url: str | None,
 ) -> None:
     app_request(
         api_base_url,
@@ -800,6 +857,7 @@ def store_legacy_crawl(
             "homepage_url": homepage_url,
             "http_code": http_code,
             "response_bytes": response_bytes,
+            "favicon_url": favicon_url,
             "crawled_at": utc_now(),
         },
     )
@@ -827,6 +885,7 @@ def store_page(
     page: PageSummary,
 ) -> None:
     payload = asdict(page)
+    payload.pop("favicon_url", None)
     payload["crawl_run_id"] = crawl_run_id
     payload["fetched_at"] = utc_now()
     app_request(
@@ -1035,13 +1094,14 @@ def crawl_site(
 
         if robots.can_fetch(normalized_homepage):
             homepage_result = fetch_url(normalized_homepage, timeout)
+            homepage_page, homepage_links = summarize_page(homepage_result, None, 0)
             store_legacy_crawl(
                 api_base_url,
                 homepage_url=normalized_homepage,
                 http_code=homepage_result.http_code,
                 response_bytes=homepage_result.response_bytes,
+                favicon_url=homepage_page.favicon_url,
             )
-            homepage_page, homepage_links = summarize_page(homepage_result, None, 0)
             pages.append(homepage_page)
             store_page(api_base_url, crawl_run_id, homepage_page)
 
@@ -1059,6 +1119,7 @@ def crawl_site(
                 homepage_url=normalized_homepage,
                 http_code=None,
                 response_bytes=0,
+                favicon_url=None,
             )
             homepage_links = []
 
