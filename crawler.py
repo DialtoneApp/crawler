@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import sys
 from collections import deque
@@ -17,8 +16,15 @@ from urllib.parse import urlencode, urljoin, urlparse, urlunparse
 from urllib.request import Request, urlopen
 from urllib.robotparser import RobotFileParser
 
+from app_api import (
+    APP_API_BASE_URL_ENV_VAR,
+    DEFAULT_APP_API_BASE_URL,
+    allowed_app_api_base_urls_text,
+    get_app_api_base_url,
+    normalize_app_api_base_url,
+)
+
 USER_AGENT = "dialtoneapp.com crawler v0.0.1"
-APP_API_BASE_URL = os.getenv("DIALTONE_API_BASE_URL", "http://localhost:5173")
 APP_API_TIMEOUT = 30.0
 HTML_CONTENT_TYPES = ("text/html", "application/xhtml+xml")
 BINARY_SUFFIXES = {
@@ -277,6 +283,11 @@ def app_request(
 
 
 def parse_args() -> argparse.Namespace:
+    try:
+        default_app_api_base_url = get_app_api_base_url()
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
     parser = argparse.ArgumentParser(
         description=(
             "Fetch homepage URLs from dialtoneapp, inspect crawler and "
@@ -285,8 +296,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--api-base-url",
-        default=APP_API_BASE_URL,
-        help=f"Dialtone API base URL. Default: {APP_API_BASE_URL}.",
+        type=normalize_app_api_base_url,
+        default=default_app_api_base_url,
+        help=(
+            "Dialtone API base URL. "
+            f"Allowed: {allowed_app_api_base_urls_text()}. "
+            f"Default: value from ${APP_API_BASE_URL_ENV_VAR}, "
+            f"otherwise {DEFAULT_APP_API_BASE_URL}/."
+        ),
     )
     parser.add_argument(
         "--limit",
