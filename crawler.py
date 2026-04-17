@@ -62,7 +62,6 @@ BINARY_SUFFIXES = {
 }
 SPECIAL_ASSETS = [
     ("llms_txt", "/llms.txt"),
-    ("llm_txt", "/llm.txt"),
     ("agents_json", "/agents.json"),
     ("well_known_agents_json", "/.well-known/agents.json"),
 ]
@@ -322,6 +321,12 @@ def parse_args() -> argparse.Namespace:
         help="Maximum number of repository domains to crawl.",
     )
     parser.add_argument(
+        "--page",
+        type=int,
+        default=1,
+        help="Page of repository domains to request from the API. Default: 1.",
+    )
+    parser.add_argument(
         "--timeout",
         type=float,
         default=10.0,
@@ -345,10 +350,13 @@ def parse_args() -> argparse.Namespace:
 def load_homepages(
     api_base_url: str,
     limit: int | None,
+    page: int,
 ) -> list[tuple[str | None, str, int | None]]:
     params: dict[str, str | int] | None = None
-    if limit is not None:
-        params = {"limit": limit}
+    if limit is not None or page != 1:
+        params = {"page": page}
+        if limit is not None:
+            params["limit"] = limit
 
     payload = app_request(
         api_base_url,
@@ -437,6 +445,10 @@ def content_type_base(content_type: str | None) -> str | None:
     if not content_type:
         return None
     return content_type.split(";", 1)[0].strip().lower()
+
+
+def is_text_plain_content_type(content_type: str | None) -> bool:
+    return content_type_base(content_type) == "text/plain"
 
 
 def decode_body(body: bytes, content_type: str | None) -> str:
@@ -542,9 +554,10 @@ def parse_robots(origin: str, timeout: float) -> RobotsPolicy:
     parser: RobotFileParser | None = None
     parsed_ok = False
     item_count: int | None = None
-    robots_text = decode_body(result.body, result.content_type) if result.http_code == 200 else None
+    is_accepted = result.http_code == 200 and is_text_plain_content_type(result.content_type)
+    robots_text = decode_body(result.body, result.content_type) if is_accepted else None
 
-    if result.http_code == 200 and result.body:
+    if is_accepted and result.body:
         lines = robots_text.splitlines() if robots_text is not None else []
         item_count = sum(
             1
@@ -566,7 +579,7 @@ def parse_robots(origin: str, timeout: float) -> RobotsPolicy:
         http_code=result.http_code,
         response_bytes=result.response_bytes,
         content_type=content_type_base(result.content_type),
-        is_present=result.http_code == 200,
+        is_present=is_accepted,
         parsed_ok=parsed_ok,
         item_count=item_count,
         robots=robots_text,
@@ -583,9 +596,13 @@ def analyze_special_asset(
     parsed_ok = False
     item_count: int | None = None
     llms_text = None
+    is_accepted = result.http_code == 200
 
-    if result.http_code == 200:
-        if asset_type in {"llms_txt", "llm_txt"}:
+    if asset_type == "llms_txt":
+        is_accepted = is_accepted and is_text_plain_content_type(result.content_type)
+
+    if is_accepted:
+        if asset_type == "llms_txt":
             text = decode_body(result.body, result.content_type)
             llms_text = text
             item_count = sum(
@@ -619,7 +636,7 @@ def analyze_special_asset(
         http_code=result.http_code,
         response_bytes=result.response_bytes,
         content_type=content_type_base(result.content_type),
-        is_present=result.http_code == 200,
+        is_present=is_accepted,
         parsed_ok=parsed_ok,
         item_count=item_count,
         llms=llms_text,
@@ -1038,7 +1055,7 @@ def build_findings(
             )
         )
 
-    if "llms_txt" not in asset_present and "llm_txt" not in asset_present:
+    if "llms_txt" not in asset_present:
         findings.append(
             Finding(
                 category="llm",
@@ -1046,7 +1063,7 @@ def build_findings(
                 severity="info",
                 page_url=None,
                 metric_value=1,
-                message="No llms.txt or llm.txt file was found.",
+                message="No llms.txt file was found.",
             )
         )
 
@@ -1173,10 +1190,9 @@ def latest_robots_content(assets: list[AssetSummary]) -> str | None:
 
 
 def preferred_llms_content(assets: list[AssetSummary]) -> str | None:
-    for asset_type in ("llms_txt", "llm_txt"):
-        for asset in assets:
-            if asset.asset_type == asset_type and asset.llms:
-                return asset.llms
+    for asset in assets:
+        if asset.asset_type == "llms_txt" and asset.llms:
+            return asset.llms
 
     return None
 
@@ -1317,9 +1333,7 @@ def crawl_site(
             llms_txt_present=any(
                 asset.is_present for asset in assets if asset.asset_type == "llms_txt"
             ),
-            llm_txt_present=any(
-                asset.is_present for asset in assets if asset.asset_type == "llm_txt"
-            ),
+            llm_txt_present=False,
             agents_json_present=agents_present,
             pages_discovered=len(discovered_urls),
             pages_crawled=sum(1 for page in pages if page.http_code is not None),
@@ -1340,7 +1354,7 @@ def crawl_site(
             asset.is_present for asset in assets if asset.asset_type == "robots_txt"
         ) else "no"
         llms_flag = "yes" if any(
-            asset.is_present for asset in assets if asset.asset_type in {"llms_txt", "llm_txt"}
+            asset.is_present for asset in assets if asset.asset_type == "llms_txt"
         ) else "no"
         agents_flag = "yes" if agents_present else "no"
 
@@ -1364,6 +1378,10 @@ def main() -> int:
         print("--limit must be > 0", file=sys.stderr)
         return 2
 
+    if args.page <= 0:
+        print("--page must be > 0", file=sys.stderr)
+        return 2
+
     if args.timeout <= 0:
         print("--timeout must be > 0", file=sys.stderr)
         return 2
@@ -1376,7 +1394,7 @@ def main() -> int:
         print("--max-depth must be >= 0", file=sys.stderr)
         return 2
 
-    rows = load_homepages(args.api_base_url, args.limit)
+    rows = load_homepages(args.api_base_url, args.limit, args.page)
 
     success_count = 0
     failure_count = 0
