@@ -20,6 +20,7 @@ from app_api import (
     APP_API_BASE_URL_ENV_VAR,
     DEFAULT_APP_API_BASE_URL,
     allowed_app_api_base_urls_text,
+    build_app_api_url,
     get_app_api_base_url,
     normalize_app_api_base_url,
 )
@@ -244,8 +245,7 @@ def app_request(
     payload: dict | list | None = None,
     params: dict[str, str | int] | None = None,
 ) -> Any:
-    base_url = api_base_url.rstrip("/")
-    url = f"{base_url}{path}"
+    url = build_app_api_url(api_base_url, path)
     if params:
         encoded = urlencode({key: value for key, value in params.items() if value is not None})
         if encoded:
@@ -302,7 +302,7 @@ def parse_args() -> argparse.Namespace:
             "Dialtone API base URL. "
             f"Allowed: {allowed_app_api_base_urls_text()}. "
             f"Default: value from ${APP_API_BASE_URL_ENV_VAR}, "
-            f"otherwise {DEFAULT_APP_API_BASE_URL}/."
+            f"otherwise {DEFAULT_APP_API_BASE_URL}."
         ),
     )
     parser.add_argument(
@@ -1308,7 +1308,7 @@ def main() -> int:
 
     print(
         (
-            f"Crawled {len(rows)} sites via {args.api_base_url.rstrip('/')} "
+            f"Crawled {len(rows)} sites via {args.api_base_url} "
             f"({success_count} succeeded, {failure_count} failed)"
         ),
         file=sys.stderr,
