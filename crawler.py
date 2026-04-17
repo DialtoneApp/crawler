@@ -917,6 +917,8 @@ def store_legacy_crawl(
     og_description: str | None,
     og_image_url: str | None,
     favicon_url: str | None,
+    robots: str | None,
+    llms: str | None,
 ) -> None:
     app_request(
         api_base_url,
@@ -934,6 +936,8 @@ def store_legacy_crawl(
             "og_description": og_description,
             "og_image_url": og_image_url,
             "favicon_url": favicon_url,
+            "robots": robots,
+            "llms": llms,
             "crawled_at": utc_now(),
         },
     )
@@ -1143,6 +1147,23 @@ def build_findings(
     return findings
 
 
+def latest_robots_content(assets: list[AssetSummary]) -> str | None:
+    for asset in reversed(assets):
+        if asset.asset_type == "robots_txt":
+            return asset.robots
+
+    return None
+
+
+def preferred_llms_content(assets: list[AssetSummary]) -> str | None:
+    for asset_type in ("llms_txt", "llm_txt"):
+        for asset in assets:
+            if asset.asset_type == asset_type and asset.llms:
+                return asset.llms
+
+    return None
+
+
 def crawl_site(
     api_base_url: str,
     repository_full_name: str | None,
@@ -1163,6 +1184,8 @@ def crawl_site(
 
     active_origin = initial_origin
     homepage_result: FetchResult | None = None
+    homepage_page: PageSummary | None = None
+    homepage_links: list[str] = []
     pages: list[PageSummary] = []
     assets: list[AssetSummary] = []
     discovered_urls: set[str] = {normalized_homepage}
@@ -1175,20 +1198,6 @@ def crawl_site(
         if robots.can_fetch(normalized_homepage):
             homepage_result = fetch_url(normalized_homepage, timeout)
             homepage_page, homepage_links = summarize_page(homepage_result, None, 0)
-            store_legacy_crawl(
-                api_base_url,
-                repository_full_name=repository_full_name,
-                homepage_url=normalized_homepage,
-                search_rank=search_rank,
-                http_code=homepage_result.http_code,
-                response_bytes=homepage_result.response_bytes,
-                final_url=homepage_page.final_url,
-                title=homepage_page.title,
-                meta_description=homepage_page.meta_description,
-                og_description=homepage_page.og_description,
-                og_image_url=homepage_page.og_image_url,
-                favicon_url=homepage_page.favicon_url,
-            )
             pages.append(homepage_page)
             store_page(api_base_url, crawl_run_id, homepage_page)
 
@@ -1201,26 +1210,28 @@ def crawl_site(
             blocked = blocked_page(normalized_homepage, None, 0)
             pages.append(blocked)
             store_page(api_base_url, crawl_run_id, blocked)
-            store_legacy_crawl(
-                api_base_url,
-                repository_full_name=repository_full_name,
-                homepage_url=normalized_homepage,
-                search_rank=search_rank,
-                http_code=None,
-                response_bytes=0,
-                final_url=None,
-                title=None,
-                meta_description=None,
-                og_description=None,
-                og_image_url=None,
-                favicon_url=None,
-            )
-            homepage_links = []
 
         for asset_type, asset_path in SPECIAL_ASSETS:
             asset = analyze_special_asset(asset_type, urljoin(active_origin + "/", asset_path.lstrip("/")), timeout)
             assets.append(asset)
             store_asset(api_base_url, crawl_run_id, asset)
+
+        store_legacy_crawl(
+            api_base_url,
+            repository_full_name=repository_full_name,
+            homepage_url=normalized_homepage,
+            search_rank=search_rank,
+            http_code=homepage_result.http_code if homepage_result else None,
+            response_bytes=homepage_result.response_bytes if homepage_result else 0,
+            final_url=homepage_page.final_url if homepage_page else None,
+            title=homepage_page.title if homepage_page else None,
+            meta_description=homepage_page.meta_description if homepage_page else None,
+            og_description=homepage_page.og_description if homepage_page else None,
+            og_image_url=homepage_page.og_image_url if homepage_page else None,
+            favicon_url=homepage_page.favicon_url if homepage_page else None,
+            robots=latest_robots_content(assets),
+            llms=preferred_llms_content(assets),
+        )
 
         queue: deque[tuple[str, str | None, int]] = deque()
         queued_urls: set[str] = set()
