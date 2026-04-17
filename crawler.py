@@ -90,6 +90,7 @@ class AssetSummary:
     is_present: bool
     parsed_ok: bool
     item_count: int | None
+    content: str | None = None
 
 
 @dataclass(frozen=True)
@@ -519,10 +520,10 @@ def parse_robots(origin: str, timeout: float) -> RobotsPolicy:
     parser: RobotFileParser | None = None
     parsed_ok = False
     item_count: int | None = None
+    content = decode_body(result.body, result.content_type) if result.http_code == 200 else None
 
     if result.http_code == 200 and result.body:
-        text = decode_body(result.body, result.content_type)
-        lines = text.splitlines()
+        lines = content.splitlines() if content is not None else []
         item_count = sum(
             1
             for line in lines
@@ -546,6 +547,7 @@ def parse_robots(origin: str, timeout: float) -> RobotsPolicy:
         is_present=result.http_code == 200,
         parsed_ok=parsed_ok,
         item_count=item_count,
+        content=content,
     )
     return RobotsPolicy(asset=asset, parser=parser)
 
@@ -558,10 +560,12 @@ def analyze_special_asset(
     result = fetch_url(asset_url, timeout)
     parsed_ok = False
     item_count: int | None = None
+    content = None
 
     if result.http_code == 200:
         if asset_type in {"llms_txt", "llm_txt"}:
             text = decode_body(result.body, result.content_type)
+            content = text
             item_count = sum(
                 1
                 for line in text.splitlines()
@@ -596,6 +600,7 @@ def analyze_special_asset(
         is_present=result.http_code == 200,
         parsed_ok=parsed_ok,
         item_count=item_count,
+        content=content,
     )
 
 
@@ -939,6 +944,8 @@ def store_asset(
     asset: AssetSummary,
 ) -> None:
     payload = asdict(asset)
+    if payload.get("content") is None:
+        payload.pop("content")
     payload["crawl_run_id"] = crawl_run_id
     payload["fetched_at"] = utc_now()
     app_request(
