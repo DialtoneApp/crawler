@@ -334,7 +334,7 @@ def parse_args() -> argparse.Namespace:
 def load_homepages(
     api_base_url: str,
     limit: int | None,
-) -> list[tuple[str, str]]:
+) -> list[tuple[str | None, str]]:
     params: dict[str, str | int] | None = None
     if limit is not None:
         params = {"limit": limit}
@@ -345,17 +345,22 @@ def load_homepages(
         params=params,
     )
 
-    if not isinstance(payload, list):
+    if isinstance(payload, dict):
+        rows_payload = payload.get("results")
+    else:
+        rows_payload = payload
+
+    if not isinstance(rows_payload, list):
         raise RuntimeError("Dialtone API returned an invalid homepage list")
 
-    rows: list[tuple[str, str]] = []
-    for row in payload:
+    rows: list[tuple[str | None, str]] = []
+    for row in rows_payload:
         if not isinstance(row, dict):
             continue
         full_name = row.get("full_name")
         homepage_url = row.get("homepage_url")
-        if isinstance(full_name, str) and isinstance(homepage_url, str):
-            rows.append((full_name, homepage_url))
+        if isinstance(homepage_url, str):
+            rows.append((full_name if isinstance(full_name, str) else None, homepage_url))
 
     return rows
 
@@ -760,7 +765,7 @@ def blocked_page(url: str, referrer_url: str | None, depth: int) -> PageSummary:
 
 def create_crawl_run(
     api_base_url: str,
-    repository_full_name: str,
+    repository_full_name: str | None,
     homepage_url: str,
     site_origin: str,
 ) -> int:
@@ -1083,7 +1088,7 @@ def build_findings(
 
 def crawl_site(
     api_base_url: str,
-    repository_full_name: str,
+    repository_full_name: str | None,
     homepage_url: str,
     timeout: float,
     max_pages: int,
