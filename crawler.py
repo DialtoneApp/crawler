@@ -119,9 +119,12 @@ class PageSummary:
     content_type: str | None
     is_html: bool
     title: str | None
+    meta_description: str | None
     meta_description_length: int | None
     canonical_url: str | None
     favicon_url: str | None
+    og_description: str | None
+    og_image_url: str | None
     meta_robots: str | None
     x_robots_tag: str | None
     h1_count: int
@@ -164,6 +167,8 @@ class PageParser(HTMLParser):
         self.text_parts: list[str] = []
         self.meta_description: str | None = None
         self.canonical_href: str | None = None
+        self.og_description: str | None = None
+        self.og_image_url: str | None = None
         self.meta_robots: str | None = None
         self.has_open_graph = False
         self.has_twitter_card = False
@@ -208,6 +213,10 @@ class PageParser(HTMLParser):
 
             if prop.startswith("og:") and content:
                 self.has_open_graph = True
+                if prop == "og:description" and self.og_description is None:
+                    self.og_description = content
+                elif prop in {"og:image", "og:image:url"} and self.og_image_url is None:
+                    self.og_image_url = content
             if name.startswith("twitter:") and content:
                 self.has_twitter_card = True
         elif lower_tag == "script":
@@ -334,7 +343,7 @@ def parse_args() -> argparse.Namespace:
 def load_homepages(
     api_base_url: str,
     limit: int | None,
-) -> list[tuple[str | None, str]]:
+) -> list[tuple[str | None, str, int | None]]:
     params: dict[str, str | int] | None = None
     if limit is not None:
         params = {"limit": limit}
@@ -353,14 +362,21 @@ def load_homepages(
     if not isinstance(rows_payload, list):
         raise RuntimeError("Dialtone API returned an invalid homepage list")
 
-    rows: list[tuple[str | None, str]] = []
+    rows: list[tuple[str | None, str, int | None]] = []
     for row in rows_payload:
         if not isinstance(row, dict):
             continue
         full_name = row.get("full_name")
         homepage_url = row.get("homepage_url")
+        search_rank = row.get("search_rank")
         if isinstance(homepage_url, str):
-            rows.append((full_name if isinstance(full_name, str) else None, homepage_url))
+            rows.append(
+                (
+                    full_name if isinstance(full_name, str) else None,
+                    homepage_url,
+                    search_rank if isinstance(search_rank, int) else None,
+                )
+            )
 
     return rows
 
@@ -634,9 +650,12 @@ def summarize_page(
                 content_type=None,
                 is_html=False,
                 title=None,
+                meta_description=None,
                 meta_description_length=None,
                 canonical_url=None,
                 favicon_url=None,
+                og_description=None,
+                og_image_url=None,
                 meta_robots=None,
                 x_robots_tag=None,
                 h1_count=0,
@@ -663,9 +682,12 @@ def summarize_page(
                 content_type=content_type_base(result.content_type),
                 is_html=False,
                 title=None,
+                meta_description=None,
                 meta_description_length=None,
                 canonical_url=None,
                 favicon_url=None,
+                og_description=None,
+                og_image_url=None,
                 meta_robots=None,
                 x_robots_tag=result.x_robots_tag,
                 h1_count=0,
@@ -703,11 +725,17 @@ def summarize_page(
         canonical_url = urljoin(final_url, parser.canonical_href.strip())
 
     favicon_url = extract_favicon_url(final_url, parser)
+    og_image_url = (
+        resolve_url(final_url, parser.og_image_url)
+        if parser.og_image_url
+        else None
+    )
     word_count = len(re.findall(r"\b[\w'-]+\b", " ".join(parser.text_parts)))
     title = " ".join(part.strip() for part in parser.title_parts if part.strip()) or None
+    meta_description = parser.meta_description
     meta_description_length = None
-    if parser.meta_description:
-        meta_description_length = len(parser.meta_description)
+    if meta_description:
+        meta_description_length = len(meta_description)
 
     page = PageSummary(
         url=result.requested_url,
@@ -720,9 +748,12 @@ def summarize_page(
         content_type=content_type_base(result.content_type),
         is_html=True,
         title=title,
+        meta_description=meta_description,
         meta_description_length=meta_description_length,
         canonical_url=canonical_url,
         favicon_url=favicon_url,
+        og_description=parser.og_description,
+        og_image_url=og_image_url,
         meta_robots=parser.meta_robots,
         x_robots_tag=result.x_robots_tag,
         h1_count=parser.h1_count,
@@ -748,9 +779,12 @@ def blocked_page(url: str, referrer_url: str | None, depth: int) -> PageSummary:
         content_type=None,
         is_html=False,
         title=None,
+        meta_description=None,
         meta_description_length=None,
         canonical_url=None,
         favicon_url=None,
+        og_description=None,
+        og_image_url=None,
         meta_robots=None,
         x_robots_tag=None,
         h1_count=0,
@@ -866,9 +900,16 @@ def fail_crawl_run(
 
 def store_legacy_crawl(
     api_base_url: str,
+    repository_full_name: str | None,
     homepage_url: str,
+    search_rank: int | None,
     http_code: int | None,
     response_bytes: int,
+    final_url: str | None,
+    title: str | None,
+    meta_description: str | None,
+    og_description: str | None,
+    og_image_url: str | None,
     favicon_url: str | None,
 ) -> None:
     app_request(
@@ -876,9 +917,16 @@ def store_legacy_crawl(
         "/api/v1/crawler/crawls",
         method="POST",
         payload={
+            "repository_full_name": repository_full_name,
             "homepage_url": homepage_url,
+            "search_rank": search_rank,
             "http_code": http_code,
             "response_bytes": response_bytes,
+            "final_url": final_url,
+            "title": title,
+            "meta_description": meta_description,
+            "og_description": og_description,
+            "og_image_url": og_image_url,
             "favicon_url": favicon_url,
             "crawled_at": utc_now(),
         },
@@ -907,7 +955,6 @@ def store_page(
     page: PageSummary,
 ) -> None:
     payload = asdict(page)
-    payload.pop("favicon_url", None)
     payload["crawl_run_id"] = crawl_run_id
     payload["fetched_at"] = utc_now()
     app_request(
@@ -1090,6 +1137,7 @@ def crawl_site(
     api_base_url: str,
     repository_full_name: str | None,
     homepage_url: str,
+    search_rank: int | None,
     timeout: float,
     max_pages: int,
     max_depth: int,
@@ -1119,9 +1167,16 @@ def crawl_site(
             homepage_page, homepage_links = summarize_page(homepage_result, None, 0)
             store_legacy_crawl(
                 api_base_url,
+                repository_full_name=repository_full_name,
                 homepage_url=normalized_homepage,
+                search_rank=search_rank,
                 http_code=homepage_result.http_code,
                 response_bytes=homepage_result.response_bytes,
+                final_url=homepage_page.final_url,
+                title=homepage_page.title,
+                meta_description=homepage_page.meta_description,
+                og_description=homepage_page.og_description,
+                og_image_url=homepage_page.og_image_url,
                 favicon_url=homepage_page.favicon_url,
             )
             pages.append(homepage_page)
@@ -1138,9 +1193,16 @@ def crawl_site(
             store_page(api_base_url, crawl_run_id, blocked)
             store_legacy_crawl(
                 api_base_url,
+                repository_full_name=repository_full_name,
                 homepage_url=normalized_homepage,
+                search_rank=search_rank,
                 http_code=None,
                 response_bytes=0,
+                final_url=None,
+                title=None,
+                meta_description=None,
+                og_description=None,
+                og_image_url=None,
                 favicon_url=None,
             )
             homepage_links = []
@@ -1282,12 +1344,13 @@ def main() -> int:
     success_count = 0
     failure_count = 0
 
-    for repository_full_name, homepage_url in rows:
+    for repository_full_name, homepage_url, search_rank in rows:
         try:
             ok, message = crawl_site(
                 args.api_base_url,
                 repository_full_name=repository_full_name,
                 homepage_url=homepage_url,
+                search_rank=search_rank,
                 timeout=args.timeout,
                 max_pages=args.max_pages,
                 max_depth=args.max_depth,
