@@ -29,8 +29,8 @@ def parse_args() -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(
         description=(
-            "Read domains from a local websites.json file, crawl each site, "
-            "and POST compact crawl summaries back to the app."
+            "Read domains from a local input file, crawl each site, and POST "
+            "compact crawl summaries back to the app."
         )
     )
     parser.add_argument(
@@ -45,10 +45,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--file",
         "--input",
+        dest="input_path",
         type=lambda value: Path(value).expanduser(),
         default=DEFAULT_INPUT_PATH,
-        help=f"Path to the websites JSON file. Default: {DEFAULT_INPUT_PATH}.",
+        help=(
+            "Path to the input file. Supports the existing websites JSON format "
+            "or a newline-delimited domains file such as ~/Documents/sites.txt. "
+            f"Default: {DEFAULT_INPUT_PATH}."
+        ),
     )
     parser.add_argument(
         "--limit",
@@ -77,19 +83,7 @@ def rows_payload_from_json(payload: Any) -> list[Any]:
     raise RuntimeError("Input JSON must be a list of website objects.")
 
 
-def load_domains(input_path: Path, limit: int | None) -> list[str]:
-    try:
-        raw = input_path.read_text(encoding="utf-8")
-    except FileNotFoundError as exc:
-        raise RuntimeError(f"Input file not found: {input_path}") from exc
-    except OSError as exc:
-        raise RuntimeError(f"Failed to read input file {input_path}: {exc}") from exc
-
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Input file contains invalid JSON: {input_path}") from exc
-
+def domains_from_json_payload(payload: Any) -> list[str]:
     rows = rows_payload_from_json(payload)
     domains: list[str] = []
 
@@ -99,6 +93,41 @@ def load_domains(input_path: Path, limit: int | None) -> list[str]:
         domain = row.get("domain")
         if isinstance(domain, str) and domain.strip():
             domains.append(domain.strip())
+
+    return domains
+
+
+def domains_from_text(raw: str) -> list[str]:
+    domains: list[str] = []
+
+    for line in raw.splitlines():
+        domain = line.strip()
+        if not domain or domain.startswith("#"):
+            continue
+        domains.append(domain)
+
+    return domains
+
+
+def load_domains(input_path: Path, limit: int | None) -> list[str]:
+    try:
+        raw = input_path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"Input file not found: {input_path}") from exc
+    except OSError as exc:
+        raise RuntimeError(f"Failed to read input file {input_path}: {exc}") from exc
+
+    stripped = raw.lstrip()
+
+    if stripped.startswith(("{", "[")):
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Input file contains invalid JSON: {input_path}") from exc
+
+        domains = domains_from_json_payload(payload)
+    else:
+        domains = domains_from_text(raw)
 
     if limit is not None:
         return domains[:limit]
@@ -118,7 +147,7 @@ def main() -> int:
         return 2
 
     try:
-        domains = load_domains(args.input, args.limit)
+        domains = load_domains(args.input_path, args.limit)
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -151,7 +180,7 @@ def main() -> int:
 
     print(
         (
-            f"Crawled {len(domains)} sites from {args.input} via {args.api_base_url} "
+            f"Crawled {len(domains)} sites from {args.input_path} via {args.api_base_url} "
             f"({success_count} succeeded, {failure_count} failed)"
         ),
         file=sys.stderr,
