@@ -301,7 +301,7 @@ def parse_args() -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(
         description=(
-            "Fetch homepage URLs from dialtoneapp, inspect crawler and "
+            "Fetch repository domains from dialtoneapp, inspect crawler and "
             "LLM-facing site files, and POST compact crawl summaries back to the app."
         )
     )
@@ -319,7 +319,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--limit",
         type=int,
-        help="Maximum number of homepage URLs to crawl.",
+        help="Maximum number of repository domains to crawl.",
     )
     parser.add_argument(
         "--timeout",
@@ -362,25 +362,46 @@ def load_homepages(
         rows_payload = payload
 
     if not isinstance(rows_payload, list):
-        raise RuntimeError("Dialtone API returned an invalid homepage list")
+        raise RuntimeError("Dialtone API returned an invalid domain list")
 
     rows: list[tuple[str | None, str, int | None]] = []
     for row in rows_payload:
         if not isinstance(row, dict):
             continue
         full_name = row.get("full_name")
-        homepage_url = row.get("homepage_url")
+        domain = row.get("domain")
+        if not isinstance(domain, str):
+            domain = row.get("homepage_url")
         search_rank = row.get("search_rank")
-        if isinstance(homepage_url, str):
+        if isinstance(domain, str):
             rows.append(
                 (
                     full_name if isinstance(full_name, str) else None,
-                    homepage_url,
+                    domain,
                     search_rank if isinstance(search_rank, int) else None,
                 )
             )
 
     return rows
+
+
+def normalize_domain(value: str) -> str:
+    candidate = value.strip()
+    if not candidate:
+        raise ValueError("domain is empty")
+
+    parsed = urlparse(candidate)
+    if not parsed.scheme:
+        parsed = urlparse(f"https://{candidate}")
+
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError(f"unsupported URL scheme: {parsed.scheme}")
+
+    hostname = (parsed.hostname or "").strip().lower().rstrip(".")
+    if not hostname:
+        raise ValueError("domain is missing a host")
+
+    return hostname
 
 
 def normalize_url(url: str) -> str:
@@ -907,13 +928,11 @@ def fail_crawl_run(
 def store_legacy_crawl(
     api_base_url: str,
     repository_full_name: str | None,
-    homepage_url: str,
+    domain: str,
     search_rank: int | None,
     http_code: int | None,
     response_bytes: int,
-    final_url: str | None,
     title: str | None,
-    meta_description: str | None,
     og_description: str | None,
     og_image_url: str | None,
     favicon_url: str | None,
@@ -926,13 +945,11 @@ def store_legacy_crawl(
         method="POST",
         payload={
             "repository_full_name": repository_full_name,
-            "homepage_url": homepage_url,
+            "domain": domain,
             "search_rank": search_rank,
             "http_code": http_code,
             "response_bytes": response_bytes,
-            "final_url": final_url,
             "title": title,
-            "meta_description": meta_description,
             "og_description": og_description,
             "og_image_url": og_image_url,
             "favicon_url": favicon_url,
@@ -1167,13 +1184,14 @@ def preferred_llms_content(assets: list[AssetSummary]) -> str | None:
 def crawl_site(
     api_base_url: str,
     repository_full_name: str | None,
-    homepage_url: str,
+    domain: str,
     search_rank: int | None,
     timeout: float,
     max_pages: int,
     max_depth: int,
 ) -> tuple[bool, str]:
-    normalized_homepage = normalize_url(homepage_url)
+    normalized_domain = normalize_domain(domain)
+    normalized_homepage = normalize_url(normalized_domain)
     initial_origin = origin_from_url(normalized_homepage)
     crawl_run_id = create_crawl_run(
         api_base_url,
@@ -1219,13 +1237,11 @@ def crawl_site(
         store_legacy_crawl(
             api_base_url,
             repository_full_name=repository_full_name,
-            homepage_url=normalized_homepage,
+            domain=normalized_domain,
             search_rank=search_rank,
             http_code=homepage_result.http_code if homepage_result else None,
             response_bytes=homepage_result.response_bytes if homepage_result else 0,
-            final_url=homepage_page.final_url if homepage_page else None,
             title=homepage_page.title if homepage_page else None,
-            meta_description=homepage_page.meta_description if homepage_page else None,
             og_description=homepage_page.og_description if homepage_page else None,
             og_image_url=homepage_page.og_image_url if homepage_page else None,
             favicon_url=homepage_page.favicon_url if homepage_page else None,
@@ -1331,7 +1347,7 @@ def crawl_site(
         return (
             True,
             (
-                f"{normalized_homepage} -> pages={sum(1 for page in pages if page.http_code is not None)} "
+                f"{normalized_domain} -> pages={sum(1 for page in pages if page.http_code is not None)} "
                 f"html={len(html_pages)} robots={robots_flag} llms={llms_flag} "
                 f"agents={agents_flag} findings={len(findings)}"
             ),
@@ -1365,12 +1381,12 @@ def main() -> int:
     success_count = 0
     failure_count = 0
 
-    for repository_full_name, homepage_url, search_rank in rows:
+    for repository_full_name, domain, search_rank in rows:
         try:
             ok, message = crawl_site(
                 args.api_base_url,
                 repository_full_name=repository_full_name,
-                homepage_url=homepage_url,
+                domain=domain,
                 search_rank=search_rank,
                 timeout=args.timeout,
                 max_pages=args.max_pages,
@@ -1378,10 +1394,10 @@ def main() -> int:
             )
         except ValueError as exc:
             ok = False
-            message = f"{homepage_url} - {exc}"
+            message = f"{domain} - {exc}"
         except Exception as exc:
             ok = False
-            message = f"{homepage_url} - crawl failed: {exc}"
+            message = f"{domain} - crawl failed: {exc}"
 
         if ok:
             success_count += 1

@@ -9,7 +9,7 @@ import sys
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 
 from app_api import (
@@ -25,6 +25,25 @@ GITHUB_API_BASE_URL = "https://api.github.com"
 APP_API_TIMEOUT = 30.0
 USER_AGENT = "repos.py"
 APP_USER_AGENT = "dialtoneapp repo sync v0.0.1"
+
+
+def normalize_domain(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+
+    candidate = value.strip()
+    if not candidate:
+        return None
+
+    parsed = urlparse(candidate)
+    if not parsed.scheme:
+        parsed = urlparse(f"https://{candidate}")
+
+    if parsed.scheme not in {"http", "https"}:
+        return None
+
+    hostname = (parsed.hostname or "").strip().lower().rstrip(".")
+    return hostname or None
 
 
 def parse_args() -> argparse.Namespace:
@@ -209,12 +228,15 @@ def sync_repository(
     search_rank: int,
     fetched_at: str,
 ) -> None:
+    payload_repo = dict(repo)
+    payload_repo["domain"] = normalize_domain(repo.get("homepage"))
+
     app_request(
         api_base_url,
         "/api/v1/crawler/repositories",
         method="POST",
         payload={
-            "repo": repo,
+            "repo": payload_repo,
             "search_rank": search_rank,
             "fetched_at": fetched_at,
         },
