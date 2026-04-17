@@ -61,18 +61,6 @@ def parse_args() -> argparse.Namespace:
         default=10.0,
         help="Per-request timeout in seconds. Default: 10.",
     )
-    parser.add_argument(
-        "--max-pages",
-        type=int,
-        default=10,
-        help="Maximum number of allowed pages to fetch per site. Default: 10.",
-    )
-    parser.add_argument(
-        "--max-depth",
-        type=int,
-        default=1,
-        help="Maximum crawl depth from the homepage. Default: 1.",
-    )
     return parser.parse_args()
 
 
@@ -129,14 +117,6 @@ def main() -> int:
         print("--timeout must be > 0", file=sys.stderr)
         return 2
 
-    if args.max_pages <= 0:
-        print("--max-pages must be > 0", file=sys.stderr)
-        return 2
-
-    if args.max_depth < 0:
-        print("--max-depth must be >= 0", file=sys.stderr)
-        return 2
-
     try:
         domains = load_domains(args.input, args.limit)
     except RuntimeError as exc:
@@ -154,8 +134,6 @@ def main() -> int:
                 domain=domain,
                 search_rank=None,
                 timeout=args.timeout,
-                max_pages=args.max_pages,
-                max_depth=args.max_depth,
             )
         except ValueError as exc:
             ok = False

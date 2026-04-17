@@ -6,7 +6,6 @@ import argparse
 import json
 import re
 import sys
-from collections import deque
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from html.parser import HTMLParser
@@ -331,18 +330,6 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=10.0,
         help="Per-request timeout in seconds. Default: 10.",
-    )
-    parser.add_argument(
-        "--max-pages",
-        type=int,
-        default=10,
-        help="Maximum number of allowed pages to fetch per site. Default: 10.",
-    )
-    parser.add_argument(
-        "--max-depth",
-        type=int,
-        default=1,
-        help="Maximum crawl depth from the homepage. Default: 1.",
     )
     return parser.parse_args()
 
@@ -1203,8 +1190,6 @@ def crawl_site(
     domain: str,
     search_rank: int | None,
     timeout: float,
-    max_pages: int,
-    max_depth: int,
 ) -> tuple[bool, str]:
     normalized_domain = normalize_domain(domain)
     normalized_homepage = normalize_url(normalized_domain)
@@ -1219,7 +1204,6 @@ def crawl_site(
     active_origin = initial_origin
     homepage_result: FetchResult | None = None
     homepage_page: PageSummary | None = None
-    homepage_links: list[str] = []
     pages: list[PageSummary] = []
     assets: list[AssetSummary] = []
     discovered_urls: set[str] = {normalized_homepage}
@@ -1231,7 +1215,7 @@ def crawl_site(
 
         if robots.can_fetch(normalized_homepage):
             homepage_result = fetch_url(normalized_homepage, timeout)
-            homepage_page, homepage_links = summarize_page(homepage_result, None, 0)
+            homepage_page, _ = summarize_page(homepage_result, None, 0)
             pages.append(homepage_page)
             store_page(api_base_url, crawl_run_id, homepage_page)
 
@@ -1264,52 +1248,6 @@ def crawl_site(
             robots=latest_robots_content(assets),
             llms=preferred_llms_content(assets),
         )
-
-        queue: deque[tuple[str, str | None, int]] = deque()
-        queued_urls: set[str] = set()
-        fetched_pages = 1 if homepage_result or pages else 0
-
-        if homepage_result and pages[0].is_html and max_depth > 0:
-            for link in homepage_links:
-                if link in discovered_urls:
-                    continue
-                discovered_urls.add(link)
-                queue.append((link, pages[0].final_url or pages[0].url, 1))
-                queued_urls.add(link)
-
-        site_netloc = urlparse(active_origin).netloc.lower()
-
-        while queue and fetched_pages < max_pages:
-            url, referrer_url, depth = queue.popleft()
-            queued_urls.discard(url)
-
-            if depth > max_depth:
-                continue
-
-            if not robots.can_fetch(url):
-                blocked = blocked_page(url, referrer_url, depth)
-                pages.append(blocked)
-                store_page(api_base_url, crawl_run_id, blocked)
-                continue
-
-            result = fetch_url(url, timeout)
-            page, links = summarize_page(result, referrer_url, depth)
-            pages.append(page)
-            store_page(api_base_url, crawl_run_id, page)
-            fetched_pages += 1
-
-            if (
-                page.is_html
-                and depth < max_depth
-                and page.final_url
-                and urlparse(page.final_url).netloc.lower() == site_netloc
-            ):
-                for link in links:
-                    if link in discovered_urls:
-                        continue
-                    discovered_urls.add(link)
-                    queue.append((link, page.final_url, depth + 1))
-                    queued_urls.add(link)
 
         findings = build_findings(assets, pages)
         store_findings(api_base_url, crawl_run_id, findings)
@@ -1386,14 +1324,6 @@ def main() -> int:
         print("--timeout must be > 0", file=sys.stderr)
         return 2
 
-    if args.max_pages <= 0:
-        print("--max-pages must be > 0", file=sys.stderr)
-        return 2
-
-    if args.max_depth < 0:
-        print("--max-depth must be >= 0", file=sys.stderr)
-        return 2
-
     rows = load_homepages(args.api_base_url, args.limit, args.page)
 
     success_count = 0
@@ -1407,8 +1337,6 @@ def main() -> int:
                 domain=domain,
                 search_rank=search_rank,
                 timeout=args.timeout,
-                max_pages=args.max_pages,
-                max_depth=args.max_depth,
             )
         except ValueError as exc:
             ok = False
