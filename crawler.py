@@ -6,7 +6,7 @@ import argparse
 import json
 import re
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from typing import Any
@@ -75,6 +75,16 @@ class FetchResult:
     content_type: str | None
     x_robots_tag: str | None
     body: bytes
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class HeadResult:
+    requested_url: str
+    final_url: str | None
+    http_code: int | None
+    content_type: str | None
+    content_length: int | None
     error: str | None = None
 
 
@@ -535,6 +545,70 @@ def fetch_url(url: str, timeout: float) -> FetchResult:
         )
 
 
+def parse_content_length_header(value: str | None) -> int | None:
+    if value is None:
+        return None
+
+    try:
+        content_length = int(value.strip())
+    except (TypeError, ValueError):
+        return None
+
+    return content_length if content_length >= 0 else None
+
+
+def head_url(url: str, timeout: float) -> HeadResult:
+    request = Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "image/*,*/*;q=0.1",
+        },
+        method="HEAD",
+    )
+
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            return HeadResult(
+                requested_url=url,
+                final_url=response.geturl(),
+                http_code=response.status,
+                content_type=response.headers.get("Content-Type"),
+                content_length=parse_content_length_header(
+                    response.headers.get("Content-Length")
+                ),
+            )
+    except HTTPError as exc:
+        return HeadResult(
+            requested_url=url,
+            final_url=exc.geturl(),
+            http_code=exc.code,
+            content_type=exc.headers.get("Content-Type"),
+            content_length=parse_content_length_header(exc.headers.get("Content-Length")),
+            error=exc.reason if isinstance(exc.reason, str) else None,
+        )
+    except URLError as exc:
+        return HeadResult(
+            requested_url=url,
+            final_url=None,
+            http_code=None,
+            content_type=None,
+            content_length=None,
+            error=str(exc.reason),
+        )
+
+
+def is_valid_image_head_result(result: HeadResult) -> bool:
+    if result.http_code is None or result.http_code < 200 or result.http_code >= 300:
+        return False
+
+    base_content_type = content_type_base(result.content_type)
+    if not base_content_type or not base_content_type.startswith("image/"):
+        return False
+
+    return result.content_length is not None and result.content_length > 0
+
+
 def parse_robots(origin: str, timeout: float) -> RobotsPolicy:
     robots_url = urljoin(origin + "/", "robots.txt")
     result = fetch_url(robots_url, timeout)
@@ -828,6 +902,27 @@ def blocked_page(url: str, referrer_url: str | None, depth: int) -> PageSummary:
     )
 
 
+def sanitize_page_image_urls(page: PageSummary, timeout: float) -> PageSummary:
+    updates: dict[str, str | None] = {}
+
+    if page.favicon_url:
+        favicon_head = head_url(page.favicon_url, timeout)
+        updates["favicon_url"] = (
+            page.favicon_url if is_valid_image_head_result(favicon_head) else None
+        )
+
+    if page.og_image_url:
+        og_image_head = head_url(page.og_image_url, timeout)
+        updates["og_image_url"] = (
+            page.og_image_url if is_valid_image_head_result(og_image_head) else None
+        )
+
+    if not updates:
+        return page
+
+    return replace(page, **updates)
+
+
 def create_crawl_run(
     api_base_url: str,
     repository_full_name: str | None,
@@ -943,24 +1038,28 @@ def store_legacy_crawl(
     robots: str | None,
     llms: str | None,
 ) -> None:
+    payload = {
+        "repository_full_name": repository_full_name,
+        "domain": domain,
+        "search_rank": search_rank,
+        "http_code": http_code,
+        "response_bytes": response_bytes,
+        "title": title,
+        "og_description": og_description,
+        "robots": robots,
+        "llms": llms,
+        "crawled_at": utc_now(),
+    }
+    if og_image_url is not None:
+        payload["og_image_url"] = og_image_url
+    if favicon_url is not None:
+        payload["favicon_url"] = favicon_url
+
     app_request(
         api_base_url,
         "/api/v1/crawler/crawls",
         method="POST",
-        payload={
-            "repository_full_name": repository_full_name,
-            "domain": domain,
-            "search_rank": search_rank,
-            "http_code": http_code,
-            "response_bytes": response_bytes,
-            "title": title,
-            "og_description": og_description,
-            "og_image_url": og_image_url,
-            "favicon_url": favicon_url,
-            "robots": robots,
-            "llms": llms,
-            "crawled_at": utc_now(),
-        },
+        payload=payload,
     )
 
 
@@ -990,6 +1089,10 @@ def store_page(
     page: PageSummary,
 ) -> None:
     payload = asdict(page)
+    if payload.get("favicon_url") is None:
+        payload.pop("favicon_url")
+    if payload.get("og_image_url") is None:
+        payload.pop("og_image_url")
     payload["crawl_run_id"] = crawl_run_id
     payload["fetched_at"] = utc_now()
     app_request(
@@ -1216,6 +1319,7 @@ def crawl_site(
         if robots.can_fetch(normalized_homepage):
             homepage_result = fetch_url(normalized_homepage, timeout)
             homepage_page, _ = summarize_page(homepage_result, None, 0)
+            homepage_page = sanitize_page_image_urls(homepage_page, timeout)
             pages.append(homepage_page)
             store_page(api_base_url, crawl_run_id, homepage_page)
 
