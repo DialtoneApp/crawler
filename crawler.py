@@ -90,7 +90,8 @@ class AssetSummary:
     is_present: bool
     parsed_ok: bool
     item_count: int | None
-    content: str | None = None
+    robots: str | None = None
+    llms: str | None = None
 
 
 @dataclass(frozen=True)
@@ -520,10 +521,10 @@ def parse_robots(origin: str, timeout: float) -> RobotsPolicy:
     parser: RobotFileParser | None = None
     parsed_ok = False
     item_count: int | None = None
-    content = decode_body(result.body, result.content_type) if result.http_code == 200 else None
+    robots_text = decode_body(result.body, result.content_type) if result.http_code == 200 else None
 
     if result.http_code == 200 and result.body:
-        lines = content.splitlines() if content is not None else []
+        lines = robots_text.splitlines() if robots_text is not None else []
         item_count = sum(
             1
             for line in lines
@@ -547,7 +548,7 @@ def parse_robots(origin: str, timeout: float) -> RobotsPolicy:
         is_present=result.http_code == 200,
         parsed_ok=parsed_ok,
         item_count=item_count,
-        content=content,
+        robots=robots_text,
     )
     return RobotsPolicy(asset=asset, parser=parser)
 
@@ -560,12 +561,12 @@ def analyze_special_asset(
     result = fetch_url(asset_url, timeout)
     parsed_ok = False
     item_count: int | None = None
-    content = None
+    llms_text = None
 
     if result.http_code == 200:
         if asset_type in {"llms_txt", "llm_txt"}:
             text = decode_body(result.body, result.content_type)
-            content = text
+            llms_text = text
             item_count = sum(
                 1
                 for line in text.splitlines()
@@ -600,7 +601,7 @@ def analyze_special_asset(
         is_present=result.http_code == 200,
         parsed_ok=parsed_ok,
         item_count=item_count,
-        content=content,
+        llms=llms_text,
     )
 
 
@@ -944,8 +945,10 @@ def store_asset(
     asset: AssetSummary,
 ) -> None:
     payload = asdict(asset)
-    if payload.get("content") is None:
-        payload.pop("content")
+    if payload.get("robots") is None:
+        payload.pop("robots")
+    if payload.get("llms") is None:
+        payload.pop("llms")
     payload["crawl_run_id"] = crawl_run_id
     payload["fetched_at"] = utc_now()
     app_request(
