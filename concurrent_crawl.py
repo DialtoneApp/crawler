@@ -16,7 +16,7 @@ import http.client
 import ssl
 
 
-USER_AGENT = "dialtoneapp.com crawler v0.0.1"
+USER_AGENT = "dialtoneapp.com crawler v0.0.1 https://dialtoneapp.com/contact human@dialtoneapp.com"
 
 WELL_KNOWN_PATHS = (
     "/.well-known/x402.json",
