@@ -80,6 +80,11 @@ def parse_args() -> argparse.Namespace:
         default=1000,
         help="Print progress every N completed domains. Use 0 to disable.",
     )
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Start at the beginning instead of resuming after the newest result file.",
+    )
     return parser.parse_args()
 
 
@@ -115,6 +120,50 @@ def iter_domains(csv_path: Path) -> Iterator[str]:
             domain = normalize_domain(candidate)
             if domain:
                 yield domain
+
+
+def latest_result_domain(results_dir: Path) -> str | None:
+    newest_file: Path | None = None
+    newest_mtime_ns = -1
+
+    for path in results_dir.glob("*.txt"):
+        if not path.is_file():
+            continue
+
+        try:
+            mtime_ns = path.stat().st_mtime_ns
+        except OSError:
+            continue
+
+        if mtime_ns > newest_mtime_ns:
+            newest_file = path
+            newest_mtime_ns = mtime_ns
+
+    if newest_file is None:
+        return None
+
+    return normalize_domain(newest_file.stem)
+
+
+def iter_domains_after(csv_path: Path, resume_after: str) -> Iterator[str]:
+    domains = iter_domains(csv_path)
+
+    for skipped, domain in enumerate(domains, start=1):
+        if domain == resume_after:
+            print(
+                f"resuming after {resume_after} from {csv_path} (skipped {skipped})",
+                file=sys.stderr,
+            )
+            break
+    else:
+        print(
+            f"resume marker {resume_after} was not found in {csv_path}; starting at beginning",
+            file=sys.stderr,
+        )
+        yield from iter_domains(csv_path)
+        return
+
+    yield from domains
 
 
 def is_allowed_content_type(content_type: str | None) -> bool:
@@ -158,6 +207,7 @@ def get_content_type(url: str, timeout: float) -> str | None:
             http.client.HTTPException,
             OSError,
             ssl.SSLError,
+            UnicodeError,
         ):
             return None
 
@@ -209,7 +259,8 @@ def crawl(args: argparse.Namespace) -> int:
 
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    domains = iter_domains(csv_path)
+    resume_after = None if args.no_resume else latest_result_domain(results_dir)
+    domains = iter_domains_after(csv_path, resume_after) if resume_after else iter_domains(csv_path)
     if args.limit is not None:
         domains = iter_limited(domains, args.limit)
 
