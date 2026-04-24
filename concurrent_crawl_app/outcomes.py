@@ -36,6 +36,7 @@ def merge_ucp_facts(primary: dict[str, Any], enriched: dict[str, Any]) -> dict[s
             "payment_handler_ids",
             "payment_endpoint_samples",
             "capability_names",
+            "shopping_mcp_endpoints",
             "payment_provider_hints",
             "payment_rail_hints",
             "payment_endpoint_hosts",

@@ -347,7 +347,23 @@ def validate_ucp(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
     handler_names: list[str] = []
     handler_ids: list[str] = []
     payment_endpoints: list[str] = []
+    shopping_mcp_endpoints: list[str] = []
     contains_placeholder = False
+
+    shopping_services = services.get("dev.ucp.shopping")
+    if isinstance(shopping_services, dict):
+        shopping_services = [shopping_services]
+    if isinstance(shopping_services, list):
+        for service in shopping_services:
+            if not isinstance(service, dict):
+                continue
+            transport = service.get("transport")
+            endpoint = service.get("endpoint")
+            if isinstance(endpoint, str) and endpoint:
+                if transport == "mcp":
+                    shopping_mcp_endpoints = merge_unique_limited(shopping_mcp_endpoints, [endpoint], limit=8)
+                if has_placeholder_value(endpoint):
+                    contains_placeholder = True
 
     payment = payload.get("payment") if isinstance(payload.get("payment"), dict) else {}
     handlers = payment.get("handlers") if isinstance(payment.get("handlers"), list) else []
@@ -412,6 +428,7 @@ def validate_ucp(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
         "payment_handler_names": sorted(set(handler_names))[:12],
         "payment_handler_ids": sorted(set(handler_ids))[:12],
         "payment_endpoint_samples": sorted(set(payment_endpoints))[:6],
+        "shopping_mcp_endpoints": shopping_mcp_endpoints,
         "current_version_url": current_version_url,
         **payment_hints,
     }

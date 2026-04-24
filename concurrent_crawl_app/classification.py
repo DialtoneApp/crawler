@@ -186,7 +186,7 @@ def classify_receipt(
                     continue
                 sample_item = dict(item)
                 handle = sample_item.get("handle")
-                if isinstance(handle, str) and handle:
+                if isinstance(handle, str) and handle and not sample_item.get("product_url"):
                     sample_item["product_url"] = f"https://{domain_input.domain}/products/{handle}"
                 sample_products.append(sample_item)
             aggregates["sample_products"] = sample_products
@@ -369,6 +369,7 @@ def classify_receipt(
             "capability_count",
             "capability_names",
             "service_count",
+            "shopping_mcp_endpoints",
             "payment_handler_count",
             "payment_handler_names",
             "payment_handler_ids",

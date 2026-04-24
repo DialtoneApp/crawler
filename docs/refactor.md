@@ -71,6 +71,7 @@
 - Expanded `callable_surface` tagging to include agent cards, x402 manifests, and verified payment probes, since many API-first sites do not expose a separate retail catalog.
 - Added payment-probe candidate ranking so the crawler prefers higher-intent actions like `send`, `buy`, `report`, or `search` over low-signal endpoints like `status` or message listing.
 - Added templated payment-probe resolution for OpenAPI commerce sites. When a paid route uses a path parameter like `{slug}`, the crawler now tries to resolve a real public resource from a sibling collection endpoint before probing the paid URL, and it carries sample title/price details into the receipt when available.
+- Added a Shopify UCP catalog fallback for stores that expose a valid `/.well-known/ucp` but block `products.json`. The crawler now extracts the store MCP endpoint from UCP, calls `search_catalog` with a valid Shopify agent profile, and records sample products/prices from the UCP result when that path is publicly available.
 
 ### Output model now
 

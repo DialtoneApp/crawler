@@ -9,6 +9,7 @@ from .helpers import extract_template_parameters, fill_template_parameters, pars
 from .http_client import build_control_fetch, fetch_url, parse_json_body
 from .models import DomainInput, FetchResponse, ProbeOutcome, ProbeSpec
 from .outcomes import build_outcome, merge_ucp_facts
+from .ucp_catalog import probe_ucp_catalog_products
 from .validators_content import validate_ucp
 
 
@@ -434,7 +435,26 @@ def probe_domain(domain_input: DomainInput, timeout: float, run_token: str):
             if api_products_outcome.status == "valid":
                 break
 
-    if outcomes[PRODUCTS_PROBE.key].status == "valid":
+    current_ucp_outcome = outcomes.get("well_known_ucp")
+    if (
+        outcomes[PRODUCTS_PROBE.key].status != "valid"
+        and outcomes.get("api_products", ProbeOutcome("", "", "", None, None)).status != "valid"
+        and current_ucp_outcome
+        and current_ucp_outcome.status == "valid"
+    ):
+        ucp_products_outcome = probe_ucp_catalog_products(
+            domain=domain,
+            homepage_title=homepage_outcome.facts.get("title") if homepage_outcome and isinstance(homepage_outcome.facts.get("title"), str) else None,
+            ucp_facts=current_ucp_outcome.facts,
+            timeout=timeout,
+        )
+        if ucp_products_outcome:
+            outcomes["api_products"] = ucp_products_outcome
+
+    if (
+        outcomes[PRODUCTS_PROBE.key].status == "valid"
+        or outcomes.get("api_products", ProbeOutcome("", "", "", None, None)).status == "valid"
+    ):
         fetch = fetch_url(f"https://{domain}{CART_PROBE.path}", timeout=timeout, max_bytes=CART_PROBE.max_bytes)
         control = None
         if CART_PROBE.control_group and fetch.status == 200:
