@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 from urllib.request import Request, urlopen
 
 
@@ -74,9 +74,11 @@ INTERESTING_PROBE_KEYS = {
     "well_known_agent_card",
     "root_agent_json",
     "openapi_json",
+    "api_openapi_json",
     "x402_json",
     "x402_well_known",
     "products_json",
+    "api_products",
 }
 
 CONTROL_PATH_TEMPLATES = {
@@ -347,6 +349,22 @@ def final_host(url: str | None) -> str | None:
         return None
 
 
+def resolve_url(base_url: str | None, candidate: Any) -> str | None:
+    if not isinstance(candidate, str):
+        return None
+    candidate = candidate.strip()
+    if not candidate:
+        return None
+    if candidate.startswith(("http://", "https://")):
+        return candidate
+    if not base_url:
+        return None
+    try:
+        return urljoin(base_url, candidate)
+    except ValueError:
+        return None
+
+
 def is_cross_host_redirect(fetch: FetchResponse) -> bool:
     requested_host = final_host(fetch.requested_url)
     final_redirect_host = final_host(fetch.final_url)
@@ -478,6 +496,8 @@ def collect_payment_hints(value: Any) -> dict[str, Any]:
     payment_surface = None
     if "x402" in rail_hints:
         payment_surface = "x402"
+    elif "saved_card" in rail_hints or "dialtoneapp_network" in provider_hints:
+        payment_surface = "saved_card_authority"
     elif {"card", "digital_wallet"} & set(rail_hints):
         payment_surface = "standard_checkout"
     elif "crypto" in rail_hints:
@@ -485,12 +505,22 @@ def collect_payment_hints(value: Any) -> dict[str, Any]:
     elif provider_hints:
         payment_surface = "provider_named"
 
+    has_non_crypto_rail = bool({"card", "digital_wallet", "saved_card"} & set(rail_hints))
+    has_crypto_markers = any(
+        any(marker in item for marker in ("usdc", "usdt", "solana", "base", "ethereum", "wallet", "coinbase", "eip155"))
+        for item in lower_strings
+    )
+    crypto_only = bool(
+        ("crypto" in rail_hints or ("x402" in rail_hints and has_crypto_markers))
+        and not has_non_crypto_rail
+    )
+
     return {
         "payment_provider_hints": sorted(set(provider_hints))[:12],
         "payment_rail_hints": sorted(set(rail_hints))[:12],
         "payment_endpoint_hosts": sorted(set(endpoint_hosts))[:12],
         "payment_surface": payment_surface,
-        "crypto_only": bool("crypto" in rail_hints and not ({"card", "digital_wallet", "x402"} & set(rail_hints))),
+        "crypto_only": crypto_only,
     }
 
 
@@ -1094,7 +1124,94 @@ def validate_agent(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
     if not (keys & expected):
         return False, "agent JSON lacked expected agent-like keys", {"top_level_keys": sorted(str(key) for key in keys)[:12]}
 
-    return True, "Agent-like JSON detected", {"top_level_keys": sorted(str(key) for key in keys)[:12]}
+    base_reference = fetch.final_url or fetch.requested_url
+    api = payload.get("api") if isinstance(payload.get("api"), dict) else {}
+    discovery = payload.get("discovery") if isinstance(payload.get("discovery"), dict) else {}
+    endpoints = payload.get("endpoints") if isinstance(payload.get("endpoints"), dict) else {}
+    payment = payload.get("payment") if isinstance(payload.get("payment"), dict) else {}
+
+    api_base_url = resolve_url(base_reference, api.get("base_url"))
+    docs_url = resolve_url(base_reference, api.get("docs")) or resolve_url(base_reference, discovery.get("docs"))
+    openapi_url = resolve_url(base_reference, discovery.get("openapi")) or resolve_url(base_reference, api.get("openapi"))
+    x402_url = resolve_url(base_reference, discovery.get("x402"))
+    brand_facts_url = resolve_url(base_reference, discovery.get("brand_facts"))
+    llms_url = resolve_url(base_reference, discovery.get("llms_txt"))
+
+    public_endpoint_urls: list[str] = []
+    product_urls: list[str] = []
+    docs_urls: list[str] = []
+    order_urls: list[str] = []
+    register_urls: list[str] = []
+    wallet_guides_urls: list[str] = []
+
+    for endpoint_name, endpoint in endpoints.items():
+        if not isinstance(endpoint, dict):
+            continue
+        raw_path = endpoint.get("path")
+        resolved_url = resolve_url(api_base_url or base_reference, raw_path)
+        auth_required = endpoint.get("auth")
+        if resolved_url and auth_required is False:
+            public_endpoint_urls = merge_unique_limited(public_endpoint_urls, [resolved_url], limit=12)
+
+        if endpoint_name == "products" and resolved_url:
+            product_urls = merge_unique_limited(product_urls, [resolved_url], limit=6)
+        elif endpoint_name == "docs" and resolved_url:
+            docs_urls = merge_unique_limited(docs_urls, [resolved_url], limit=6)
+        elif endpoint_name == "orders" and resolved_url:
+            order_urls = merge_unique_limited(order_urls, [resolved_url], limit=6)
+        elif endpoint_name == "register" and resolved_url:
+            register_urls = merge_unique_limited(register_urls, [resolved_url], limit=6)
+        elif endpoint_name == "wallet_guides" and resolved_url:
+            wallet_guides_urls = merge_unique_limited(wallet_guides_urls, [resolved_url], limit=6)
+
+    payment_protocol = payment.get("protocol") if isinstance(payment.get("protocol"), str) else None
+    recommended_client = payment.get("recommended_client") if isinstance(payment.get("recommended_client"), str) else None
+    payment_network_names: list[str] = []
+    payment_chain_ids: list[str] = []
+    payment_currency_codes: list[str] = []
+    payment_assets: list[str] = []
+    raw_networks = payment.get("networks") if isinstance(payment.get("networks"), list) else []
+    for network in raw_networks:
+        if not isinstance(network, dict):
+            continue
+        name = network.get("name")
+        chain_id = network.get("chain_id")
+        currency = network.get("currency")
+        asset = network.get("asset")
+        if isinstance(name, str) and name.strip():
+            payment_network_names = merge_unique_limited(payment_network_names, [name.strip()], limit=12)
+        if isinstance(chain_id, str) and chain_id.strip():
+            payment_chain_ids = merge_unique_limited(payment_chain_ids, [chain_id.strip()], limit=12)
+        if isinstance(currency, str) and currency.strip():
+            payment_currency_codes = merge_unique_limited(payment_currency_codes, [currency.strip().upper()[:12]], limit=12)
+        if isinstance(asset, str) and asset.strip():
+            payment_assets = merge_unique_limited(payment_assets, [asset.strip()], limit=12)
+
+    payment_hints = collect_payment_hints(payload)
+
+    return True, "Agent-like JSON detected", {
+        "top_level_keys": sorted(str(key) for key in keys)[:12],
+        "api_base_url": api_base_url,
+        "docs_url": docs_url,
+        "openapi_url": openapi_url,
+        "x402_url": x402_url,
+        "brand_facts_url": brand_facts_url,
+        "llms_url": llms_url,
+        "public_endpoint_urls": public_endpoint_urls,
+        "public_endpoint_count": len(public_endpoint_urls),
+        "product_urls": product_urls,
+        "docs_urls": docs_urls or ([docs_url] if docs_url else []),
+        "order_urls": order_urls,
+        "register_urls": register_urls,
+        "wallet_guides_urls": wallet_guides_urls,
+        "payment_protocol": payment_protocol,
+        "payment_network_names": payment_network_names,
+        "payment_chain_ids": payment_chain_ids,
+        "payment_currency_codes": payment_currency_codes,
+        "payment_assets": payment_assets,
+        "recommended_client": recommended_client,
+        **payment_hints,
+    }
 
 
 def validate_agents(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
@@ -1249,7 +1366,25 @@ def validate_x402(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
                     "top_level_keys": sorted(keys)[:12],
                     "probe_only": True,
                 }
-            return True, "x402-like JSON detected", {"top_level_keys": sorted(keys)[:12]}
+            resource_urls: list[str] = []
+            for resource in resources:
+                if isinstance(resource, str) and resource.strip():
+                    resource_urls = merge_unique_limited(resource_urls, [resource.strip()], limit=12)
+                elif isinstance(resource, dict):
+                    for candidate_key in ("url", "resource", "endpoint"):
+                        candidate_value = resource.get(candidate_key)
+                        if isinstance(candidate_value, str) and candidate_value.strip():
+                            resource_urls = merge_unique_limited(resource_urls, [candidate_value.strip()], limit=12)
+                            break
+            payment_hints = collect_payment_hints(payload)
+            return True, "x402-like JSON detected", {
+                "top_level_keys": sorted(keys)[:12],
+                "resource_urls": resource_urls,
+                "resource_url_count": len(resource_urls),
+                "accept_count": len(accepts),
+                "instructions_char_count": len(payload.get("instructions", "")) if isinstance(payload.get("instructions"), str) else 0,
+                **payment_hints,
+            }
 
         if isinstance(payload, list) and payload:
             return True, "x402-like JSON list detected", {"item_count": len(payload)}
@@ -1277,6 +1412,12 @@ def validate_products(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
     products: list[Any]
     if isinstance(payload, dict) and isinstance(payload.get("products"), list):
         products = payload["products"]
+    elif (
+        isinstance(payload, dict)
+        and isinstance(payload.get("data"), dict)
+        and isinstance(payload["data"].get("products"), list)
+    ):
+        products = payload["data"]["products"]
     elif isinstance(payload, list):
         products = payload
     else:
@@ -1294,22 +1435,42 @@ def validate_products(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
     sample_titles: list[str] = []
     sample_products: list[dict[str, Any]] = []
     seen_samples: set[tuple[str | None, str | None]] = set()
+    preorder_product_count = 0
+    stock_statuses: set[str] = set()
 
     for product in products:
         if not isinstance(product, dict):
             continue
         product_count += 1
-        title = product.get("title")
+        title = product.get("title") if isinstance(product.get("title"), str) else product.get("name")
         if isinstance(title, str) and title:
             sample_titles = merge_unique_limited(sample_titles, [title[:120]], limit=3)
 
         variants = product.get("variants")
+        if not isinstance(variants, list):
+            variants = product.get("variations")
         product_min_price: float | None = None
         product_max_price: float | None = None
         available_variant_count = 0
         requires_shipping = False
+        sku = product.get("sku")
+        slug = product.get("slug")
+        json_ld = product.get("jsonLd") if isinstance(product.get("jsonLd"), dict) else {}
+        json_ld_offers = json_ld.get("offers") if isinstance(json_ld.get("offers"), dict) else {}
+        product_currency = product.get("currency") or json_ld_offers.get("priceCurrency")
+        if isinstance(product_currency, str) and product_currency:
+            currencies.add(product_currency.upper()[:8])
+        product_price = parse_price(product.get("price") or json_ld_offers.get("price"))
+        availability = json_ld_offers.get("availability")
+        if isinstance(availability, str) and availability:
+            availability_value = availability.rsplit("/", 1)[-1]
+            stock_statuses.add(availability_value)
+            if availability_value.lower() == "preorder":
+                preorder_product_count += 1
         sample_key = (
-            product.get("handle") if isinstance(product.get("handle"), str) else None,
+            product.get("handle") if isinstance(product.get("handle"), str) else (
+                slug if isinstance(slug, str) else None
+            ),
             title if isinstance(title, str) else None,
         )
         if not isinstance(variants, list):
@@ -1317,22 +1478,33 @@ def validate_products(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
                 sample_products.append({
                     "title": title,
                     "handle": product.get("handle"),
+                    "slug": slug,
+                    "sku": sku,
                     "product_type": product.get("product_type"),
                     "vendor": product.get("vendor"),
+                    "min_price": product_price,
+                    "max_price": product_price,
+                    "availability": availability.rsplit("/", 1)[-1] if isinstance(availability, str) and availability else None,
                 })
                 seen_samples.add(sample_key)
+            if product_price is not None:
+                priced_variant_count += 1
+                min_price = product_price if min_price is None else min(min_price, product_price)
+                max_price = product_price if max_price is None else max(max_price, product_price)
             continue
 
         for variant in variants:
             if not isinstance(variant, dict):
                 continue
             variant_count += 1
-            if variant.get("available") is True:
+            if variant.get("available") is True or normalize_status_value(variant.get("stock_status")) == "instock":
                 available_variant_count += 1
+            if isinstance(variant.get("stock_status"), str) and variant.get("stock_status").strip():
+                stock_statuses.add(variant.get("stock_status").strip())
             if variant.get("requires_shipping") is True:
                 requires_shipping = True
             price = parse_price(variant.get("price"))
-            currency = variant.get("currency") or product.get("currency")
+            currency = variant.get("currency") or product_currency
             if isinstance(currency, str) and currency:
                 currencies.add(currency.upper()[:8])
             if price is None:
@@ -1343,17 +1515,27 @@ def validate_products(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
             product_min_price = price if product_min_price is None else min(product_min_price, price)
             product_max_price = price if product_max_price is None else max(product_max_price, price)
 
+        if product_min_price is None and product_price is not None:
+            priced_variant_count += 1
+            min_price = product_price if min_price is None else min(min_price, product_price)
+            max_price = product_price if max_price is None else max(max_price, product_price)
+            product_min_price = product_price
+            product_max_price = product_price
+
         if len(sample_products) < 3 and sample_key not in seen_samples:
             sample_products.append({
                 "title": title,
                 "handle": product.get("handle"),
+                "slug": slug,
+                "sku": sku,
                 "product_type": product.get("product_type"),
                 "vendor": product.get("vendor"),
-                "min_price": product_min_price,
-                "max_price": product_max_price,
+                "min_price": product_min_price if product_min_price is not None else product_price,
+                "max_price": product_max_price if product_max_price is not None else product_price,
                 "available_variant_count": available_variant_count,
                 "variant_count": len(variants),
                 "requires_shipping": requires_shipping,
+                "availability": availability.rsplit("/", 1)[-1] if isinstance(availability, str) and availability else None,
             })
             seen_samples.add(sample_key)
 
@@ -1365,10 +1547,13 @@ def validate_products(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
         "variant_count": variant_count,
         "priced_variant_count": priced_variant_count,
         "currency_count": len(currencies),
+        "currency_codes": sorted(currencies)[:12],
         "min_price": min_price,
         "max_price": max_price,
         "sample_titles": sample_titles,
         "sample_products": sample_products,
+        "preorder_product_count": preorder_product_count,
+        "stock_statuses": sorted(stock_statuses)[:12],
     }
 
 
@@ -1604,6 +1789,75 @@ def should_probe_products(homepage_fetch: FetchResponse, homepage_outcome: Probe
     return any(marker in text for marker in shopify_markers)
 
 
+def best_valid_outcome(outcomes: dict[str, ProbeOutcome], keys: tuple[str, ...]) -> ProbeOutcome | None:
+    for key in keys:
+        outcome = outcomes.get(key)
+        if outcome and outcome.status == "valid":
+            return outcome
+    return None
+
+
+def merge_agent_facts(outcomes: dict[str, ProbeOutcome]) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    list_keys = {
+        "public_endpoint_urls",
+        "product_urls",
+        "docs_urls",
+        "order_urls",
+        "register_urls",
+        "wallet_guides_urls",
+        "payment_network_names",
+        "payment_chain_ids",
+        "payment_currency_codes",
+        "payment_assets",
+        "payment_provider_hints",
+        "payment_rail_hints",
+        "payment_endpoint_hosts",
+    }
+    scalar_keys = {
+        "api_base_url",
+        "docs_url",
+        "openapi_url",
+        "x402_url",
+        "brand_facts_url",
+        "llms_url",
+        "payment_protocol",
+        "recommended_client",
+        "payment_surface",
+        "crypto_only",
+    }
+    for key in ("well_known_agent_json", "root_agent_json", "well_known_agent_card"):
+        outcome = outcomes.get(key)
+        if not outcome or outcome.status != "valid":
+            continue
+        for fact_key in list_keys:
+            if isinstance(outcome.facts.get(fact_key), list):
+                merged[fact_key] = merge_unique_limited(
+                    merged.get(fact_key, []) if isinstance(merged.get(fact_key), list) else [],
+                    outcome.facts[fact_key],
+                    limit=12,
+                )
+        for fact_key in scalar_keys:
+            if fact_key not in merged and outcome.facts.get(fact_key):
+                merged[fact_key] = outcome.facts[fact_key]
+    if isinstance(merged.get("public_endpoint_urls"), list):
+        merged["public_endpoint_count"] = len(merged["public_endpoint_urls"])
+    return merged
+
+
+def build_dynamic_probe_outcome(
+    *,
+    key: str,
+    url: str,
+    validator: str,
+    timeout: float,
+    max_bytes: int,
+) -> ProbeOutcome:
+    fetch = fetch_url(url, timeout=timeout, max_bytes=max_bytes)
+    spec = ProbeSpec(key=key, path=url, validator=validator, max_bytes=max_bytes)
+    return build_outcome(spec, fetch)
+
+
 def classify_receipt(
     domain_input: DomainInput,
     outcomes: dict[str, ProbeOutcome],
@@ -1628,16 +1882,27 @@ def classify_receipt(
 
     if "llms_txt" in valid_keys or "llms_full_txt" in valid_keys:
         tags.append("ai_readable")
-    if "well_known_ucp" in valid_keys or "products_json" in valid_keys:
+    if "well_known_ucp" in valid_keys or "products_json" in valid_keys or "api_products" in valid_keys:
         tags.append("catalog_surface")
-    if {"openapi_json", "well_known_commerce", "well_known_agent_json", "well_known_agents_json", "root_agent_json"} & valid_keys:
+    if {"openapi_json", "api_openapi_json", "well_known_commerce", "well_known_agent_json", "well_known_agents_json", "root_agent_json"} & valid_keys:
         tags.append("callable_surface")
     if {"robots_txt", "sitemap_xml"} <= valid_keys:
         tags.append("crawl_basics")
 
-    products = outcomes.get("products_json")
+    products = best_valid_outcome(outcomes, ("products_json", "api_products"))
     if products and products.status == "valid":
-        for key in ("product_count", "variant_count", "priced_variant_count", "currency_count", "min_price", "max_price", "sample_titles"):
+        for key in (
+            "product_count",
+            "variant_count",
+            "priced_variant_count",
+            "currency_count",
+            "currency_codes",
+            "min_price",
+            "max_price",
+            "sample_titles",
+            "preorder_product_count",
+            "stock_statuses",
+        ):
             if key in products.facts:
                 aggregates[key] = products.facts[key]
         if "sample_products" in products.facts:
@@ -1651,6 +1916,15 @@ def classify_receipt(
                     sample_item["product_url"] = f"https://{domain_input.domain}/products/{handle}"
                 sample_products.append(sample_item)
             aggregates["sample_products"] = sample_products
+        if aggregates.get("sample_products") and isinstance(products.facts.get("currency_codes"), list) and products.facts["currency_codes"]:
+            default_currency = next(
+                (code for code in products.facts["currency_codes"] if isinstance(code, str) and code),
+                None,
+            )
+            if default_currency:
+                for item in aggregates["sample_products"]:
+                    if isinstance(item, dict) and item.get("min_price") is not None and "currency" not in item:
+                        item["currency"] = default_currency
 
     cart = outcomes.get("cart_json")
     if cart and cart.status == "valid":
@@ -1662,7 +1936,7 @@ def classify_receipt(
                 if isinstance(item, dict) and item.get("min_price") is not None and "currency" not in item:
                     item["currency"] = cart.facts["currency"]
 
-    openapi = outcomes.get("openapi_json")
+    openapi = best_valid_outcome(outcomes, ("openapi_json", "api_openapi_json"))
     if openapi and openapi.status == "valid":
         for key in (
             "path_count",
@@ -1674,6 +1948,56 @@ def classify_receipt(
         ):
             if key in openapi.facts:
                 aggregates[f"openapi_{key}"] = openapi.facts[key]
+
+    agent_facts = merge_agent_facts(outcomes)
+    if agent_facts:
+        for key in (
+            "api_base_url",
+            "docs_url",
+            "openapi_url",
+            "x402_url",
+            "brand_facts_url",
+            "llms_url",
+            "public_endpoint_urls",
+            "public_endpoint_count",
+            "product_urls",
+            "docs_urls",
+            "order_urls",
+            "register_urls",
+            "wallet_guides_urls",
+            "payment_protocol",
+            "payment_network_names",
+            "payment_chain_ids",
+            "payment_currency_codes",
+            "payment_assets",
+            "recommended_client",
+            "payment_provider_hints",
+            "payment_rail_hints",
+            "payment_endpoint_hosts",
+            "payment_surface",
+            "crypto_only",
+        ):
+            if key in agent_facts:
+                aggregates[f"agent_{key}"] = agent_facts[key]
+        payment_provider_hints = merge_unique_limited(
+            payment_provider_hints,
+            agent_facts.get("payment_provider_hints", []) if isinstance(agent_facts.get("payment_provider_hints"), list) else [],
+            limit=12,
+        )
+        payment_rail_hints = merge_unique_limited(
+            payment_rail_hints,
+            agent_facts.get("payment_rail_hints", []) if isinstance(agent_facts.get("payment_rail_hints"), list) else [],
+            limit=12,
+        )
+        payment_endpoint_hosts = merge_unique_limited(
+            payment_endpoint_hosts,
+            agent_facts.get("payment_endpoint_hosts", []) if isinstance(agent_facts.get("payment_endpoint_hosts"), list) else [],
+            limit=12,
+        )
+        if not payment_surface and isinstance(agent_facts.get("payment_surface"), str):
+            payment_surface = agent_facts["payment_surface"]
+        if bool(agent_facts.get("crypto_only")):
+            crypto_only = True
 
     commerce = outcomes.get("well_known_commerce")
     if commerce and commerce.status == "valid":
@@ -1796,6 +2120,41 @@ def classify_receipt(
         if bool(ucp.facts.get("crypto_only")):
             crypto_only = True
 
+    x402 = best_valid_outcome(outcomes, ("x402_json", "x402_well_known"))
+    if x402 and x402.status == "valid":
+        for key in (
+            "resource_urls",
+            "resource_url_count",
+            "accept_count",
+            "instructions_char_count",
+            "payment_provider_hints",
+            "payment_rail_hints",
+            "payment_endpoint_hosts",
+            "payment_surface",
+            "crypto_only",
+        ):
+            if key in x402.facts:
+                aggregates[f"x402_{key}"] = x402.facts[key]
+        payment_provider_hints = merge_unique_limited(
+            payment_provider_hints,
+            x402.facts.get("payment_provider_hints", []) if isinstance(x402.facts.get("payment_provider_hints"), list) else [],
+            limit=12,
+        )
+        payment_rail_hints = merge_unique_limited(
+            payment_rail_hints,
+            x402.facts.get("payment_rail_hints", []) if isinstance(x402.facts.get("payment_rail_hints"), list) else [],
+            limit=12,
+        )
+        payment_endpoint_hosts = merge_unique_limited(
+            payment_endpoint_hosts,
+            x402.facts.get("payment_endpoint_hosts", []) if isinstance(x402.facts.get("payment_endpoint_hosts"), list) else [],
+            limit=12,
+        )
+        if not payment_surface and isinstance(x402.facts.get("payment_surface"), str):
+            payment_surface = x402.facts["payment_surface"]
+        if bool(x402.facts.get("crypto_only")):
+            crypto_only = True
+
     if {"x402_json", "x402_well_known"} & valid_keys:
         payment_provider_hints = merge_unique_limited(payment_provider_hints, ["x402"], limit=12)
         payment_rail_hints = merge_unique_limited(payment_rail_hints, ["x402"], limit=12)
@@ -1904,6 +2263,39 @@ def probe_domain(domain_input: DomainInput, timeout: float, run_token: str) -> C
                     facts=merge_ucp_facts(root_ucp_outcome.facts, versioned_facts),
                 )
 
+    agent_facts = merge_agent_facts(outcomes)
+    openapi_candidate_urls = [
+        url
+        for url in [
+            agent_facts.get("openapi_url"),
+        ]
+        if isinstance(url, str) and url
+    ]
+    if outcomes.get("openapi_json") and outcomes["openapi_json"].status != "valid" and openapi_candidate_urls:
+        for candidate_url in openapi_candidate_urls:
+            if candidate_url == outcomes["openapi_json"].final_url or candidate_url == f"https://{domain}/openapi.json":
+                continue
+            api_openapi_outcome = build_dynamic_probe_outcome(
+                key="api_openapi_json",
+                url=candidate_url,
+                validator="openapi",
+                timeout=timeout,
+                max_bytes=BASE_PROBES[11].max_bytes,
+            )
+            outcomes["api_openapi_json"] = api_openapi_outcome
+            if api_openapi_outcome.status == "valid":
+                break
+
+    api_product_candidate_urls = [
+        url
+        for url in (
+            agent_facts.get("product_urls")
+            if isinstance(agent_facts.get("product_urls"), list)
+            else []
+        )
+        if isinstance(url, str) and url
+    ]
+
     if should_probe_products(homepage_fetch, homepage_outcome, outcomes):
         fetch = fetch_url(f"https://{domain}{PRODUCTS_PROBE.path}", timeout=timeout, max_bytes=PRODUCTS_PROBE.max_bytes)
         control = None
@@ -1919,6 +2311,21 @@ def probe_domain(domain_input: DomainInput, timeout: float, run_token: str) -> C
             content_type=None,
             detail="Skipped because homepage/UCP did not suggest a product catalog",
         )
+
+    if outcomes[PRODUCTS_PROBE.key].status != "valid" and api_product_candidate_urls:
+        for candidate_url in api_product_candidate_urls:
+            if candidate_url == f"https://{domain}{PRODUCTS_PROBE.path}":
+                continue
+            api_products_outcome = build_dynamic_probe_outcome(
+                key="api_products",
+                url=candidate_url,
+                validator="products",
+                timeout=timeout,
+                max_bytes=PRODUCTS_PROBE.max_bytes,
+            )
+            outcomes["api_products"] = api_products_outcome
+            if api_products_outcome.status == "valid":
+                break
 
     if outcomes[PRODUCTS_PROBE.key].status == "valid":
         fetch = fetch_url(f"https://{domain}{CART_PROBE.path}", timeout=timeout, max_bytes=CART_PROBE.max_bytes)

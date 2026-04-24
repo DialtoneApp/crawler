@@ -50,6 +50,8 @@
 - Extended commerce parsing to support alternate vendor schemas such as `offerings`, `priceCurrency`, `unit`, `checkout_url`, `paymentHandlers`, and `billing_provider`, so non-Shopify SaaS pricing manifests can still produce offer receipts.
 - Tightened x402 validation so probe/example manifests that explicitly say they do not accept per-call x402 payments no longer count as live machine-payment surfaces.
 - Added prelaunch/preorder detection from commerce status and billing-provider state, so priced offers that are documented but not yet live do not get upgraded to `machine_payable`.
+- Added agent-discovery enrichment so valid `agent.json` documents can advertise follow-up public probes such as API OpenAPI URLs and public product endpoints. The crawler now uses those advertised URLs to enrich receipts for API-first commerce sites like x402 storefronts.
+- Expanded product parsing beyond Shopify `products.json` to accept wrapped API payloads and record richer sample fields such as `sku`, `slug`, stock/preorder hints, and currency codes when publicly available.
 
 ### Output model now
 
