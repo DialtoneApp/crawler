@@ -169,6 +169,15 @@ def candidate_keys_for_parameter(parameter: str) -> list[str]:
     return deduped
 
 
+def default_value_for_parameter(parameter: str) -> Any | None:
+    lowered = parameter.strip().lower().replace("-", "_")
+    if lowered == "domain":
+        return "example.com"
+    if lowered in {"slug", "handle"}:
+        return "sample-name"
+    return None
+
+
 def extract_parameter_value(item: dict[str, Any], parameter: str) -> Any:
     lowered_item = {
         str(key).strip().lower().replace("-", "_"): value
@@ -272,7 +281,20 @@ def resolve_template_candidate(
         if isinstance(value, str) and value and value not in discovery_urls:
             discovery_urls.append(value)
     if not discovery_urls:
-        return None, "Skipped templated payment probe candidate without a discovery URL"
+        default_replacements: dict[str, Any] = {}
+        for parameter_name in parameter_names:
+            default_value = default_value_for_parameter(parameter_name)
+            if default_value is None:
+                return None, "Skipped templated payment probe candidate without a discovery URL"
+            default_replacements[parameter_name] = default_value
+        resolved_url = fill_template_parameters(candidate_url, default_replacements)
+        if not isinstance(resolved_url, str) or not resolved_url or extract_template_parameters(resolved_url):
+            return None, "Skipped templated payment probe candidate because the resource URL could not be resolved"
+        resolved_candidate = dict(candidate)
+        resolved_candidate["url"] = resolved_url
+        resolved_candidate["resolved_from_template"] = True
+        resolved_candidate["resolved_parameters"] = default_replacements
+        return resolved_candidate, None
 
     selected_item: dict[str, Any] | None = None
     replacements: dict[str, Any] = {}
@@ -570,7 +592,6 @@ def probe_domain(domain_input: DomainInput, timeout: float, run_token: str):
             detail="Skipped because no valid public catalog was detected",
         )
 
-    payment_probe_candidate: dict[str, object] | None = None
     payment_probe_skip_detail = "Skipped because no payment probe candidate was discovered"
     fallback_discovery_urls: list[str] = []
     for fact_key in ("public_endpoint_urls", "product_urls", "order_urls", "register_urls"):
@@ -579,21 +600,21 @@ def probe_domain(domain_input: DomainInput, timeout: float, run_token: str):
             for value in values:
                 if isinstance(value, str) and value and value not in fallback_discovery_urls:
                     fallback_discovery_urls.append(value)
+    best_payment_probe_outcome: ProbeOutcome | None = None
     for raw_candidate in iter_payment_probe_candidates(outcomes):
         resolved_candidate, resolution_detail = resolve_template_candidate(
             raw_candidate,
             timeout,
             fallback_discovery_urls=fallback_discovery_urls,
         )
-        if resolved_candidate is not None:
-            payment_probe_candidate = resolved_candidate
-            break
-        if resolution_detail:
-            payment_probe_skip_detail = resolution_detail
-    if payment_probe_candidate:
-        candidate_url = payment_probe_candidate.get("url")
-        candidate_method = payment_probe_candidate.get("method")
-        candidate_content_type = payment_probe_candidate.get("content_type")
+        if resolved_candidate is None:
+            if resolution_detail:
+                payment_probe_skip_detail = resolution_detail
+            continue
+
+        candidate_url = resolved_candidate.get("url")
+        candidate_method = resolved_candidate.get("method")
+        candidate_content_type = resolved_candidate.get("content_type")
         if isinstance(candidate_url, str) and candidate_url:
             payment_probe_outcome = build_dynamic_probe_outcome(
                 key="payment_probe",
@@ -602,7 +623,7 @@ def probe_domain(domain_input: DomainInput, timeout: float, run_token: str):
                 timeout=timeout,
                 max_bytes=65_536,
                 method=candidate_method if isinstance(candidate_method, str) and candidate_method else "GET",
-                body=build_payment_probe_body(payment_probe_candidate),
+                body=build_payment_probe_body(resolved_candidate),
                 content_type=candidate_content_type if isinstance(candidate_content_type, str) and candidate_content_type else "application/json",
             )
             payment_probe_facts = dict(payment_probe_outcome.facts)
@@ -617,11 +638,11 @@ def probe_domain(domain_input: DomainInput, timeout: float, run_token: str):
                 "resolved_from_template",
                 "resolved_parameters",
             ):
-                if fact_key in payment_probe_candidate:
-                    payment_probe_facts[f"candidate_{fact_key}"] = payment_probe_candidate[fact_key]
-            if "body" in payment_probe_candidate:
-                payment_probe_facts["candidate_body"] = payment_probe_candidate["body"]
-            outcomes["payment_probe"] = ProbeOutcome(
+                if fact_key in resolved_candidate:
+                    payment_probe_facts[f"candidate_{fact_key}"] = resolved_candidate[fact_key]
+            if "body" in resolved_candidate:
+                payment_probe_facts["candidate_body"] = resolved_candidate["body"]
+            candidate_outcome = ProbeOutcome(
                 key=payment_probe_outcome.key,
                 path=payment_probe_outcome.path,
                 status=payment_probe_outcome.status,
@@ -633,23 +654,31 @@ def probe_domain(domain_input: DomainInput, timeout: float, run_token: str):
                 detail=payment_probe_outcome.detail,
                 facts=payment_probe_facts,
             )
+            if best_payment_probe_outcome is None:
+                best_payment_probe_outcome = candidate_outcome
+            if candidate_outcome.facts.get("probe_result") in {"payment_challenge", "success_without_payment"}:
+                best_payment_probe_outcome = candidate_outcome
+                break
         else:
-            outcomes["payment_probe"] = ProbeOutcome(
+            if best_payment_probe_outcome is None:
+                best_payment_probe_outcome = ProbeOutcome(
+                    key="payment_probe",
+                    path="dynamic",
+                    status="skipped",
+                    http_status=None,
+                    content_type=None,
+                    detail="Skipped because candidate URL was missing",
+                )
+    if best_payment_probe_outcome is not None:
+        outcomes["payment_probe"] = best_payment_probe_outcome
+    else:
+        outcomes["payment_probe"] = ProbeOutcome(
                 key="payment_probe",
                 path="dynamic",
                 status="skipped",
                 http_status=None,
                 content_type=None,
-                detail="Skipped because candidate URL was missing",
+                detail=payment_probe_skip_detail,
             )
-    else:
-        outcomes["payment_probe"] = ProbeOutcome(
-            key="payment_probe",
-            path="dynamic",
-            status="skipped",
-            http_status=None,
-            content_type=None,
-            detail=payment_probe_skip_detail,
-        )
 
     return classify_receipt(domain_input, outcomes)

@@ -85,6 +85,11 @@
   - nested string endpoint maps like `endpoints.rest.agents`
 - Added template-probe fallback discovery from agent-listed public endpoints, so templated paid routes like `aibtc.com/api/inbox/{address}` can resolve a real resource ID even when the OpenAPI path has no obvious sibling collection route.
 - Extended x402 parsing to handle list-style endpoint manifests and improved probe-body heuristics for paid submission/inbox flows. This lets simple manifests like `a2alist.ai` generate a real `payment_probe`, and it avoids placeholder `"string"` request bodies when a better URL-based heuristic exists.
+- Fixed OpenAPI path resolution so `servers[].url` base paths like `https://agoragentic.com/api` are preserved when a path starts with `/...`. Without this, the crawler incorrectly probed root URLs like `/stake` instead of `/api/stake`.
+- Added support for method-prefixed x402 resource strings like `POST /api/x402/invoke/...`, so manifests that publish plain `resources` arrays now generate usable sample actions and payment-probe candidates.
+- Extended template handling to understand colon-style path params like `:domain` and added safe default substitutions for simple cases. This lets priced agent-extension maps such as `scoutscore.ai`'s `/api/bazaar/score/:domain` produce a live `402` verification probe.
+- Added priced endpoint extraction from `agent.json` capability extensions, especially `capabilities.extensions[].params.pricing.endpoints`, so x402/payment metadata embedded in agent extensions produces `sample_actions` and `payment_probe_candidates`.
+- Reworked the payment-probe step to keep trying candidates until it finds a real `402` challenge or a real unpaid success, instead of stopping at the first auth-gated or low-signal candidate. This fixed cases like `agoragentic.com`, where the first candidate hit an authenticated staking route but a later x402 invoke route returned the real challenge.
 
 ### Output model now
 

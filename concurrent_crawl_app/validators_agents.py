@@ -3,11 +3,20 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from .helpers import collect_payment_hints, derive_x402_discovery_url, final_host, merge_unique_limited, resolve_url
+from .helpers import (
+    collect_payment_hints,
+    derive_x402_discovery_url,
+    extract_template_parameters,
+    final_host,
+    merge_unique_limited,
+    resolve_openapi_path,
+    resolve_url,
+)
 from .http_client import parse_json_body
 from .models import FetchResponse
 from .validators_support import (
     build_action_sample,
+    build_probe_candidate,
     extract_x402_actions,
     merge_action_samples,
     merge_probe_candidates,
@@ -75,6 +84,7 @@ def validate_agent(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
     top_level_url = resolve_url(base_reference, payload.get("url"))
     api = payload.get("api") if isinstance(payload.get("api"), dict) else {}
     authentication = payload.get("authentication") if isinstance(payload.get("authentication"), dict) else {}
+    capabilities = payload.get("capabilities") if isinstance(payload.get("capabilities"), dict) else {}
     discovery = payload.get("discovery") if isinstance(payload.get("discovery"), dict) else {}
     documentation = payload.get("documentation") if isinstance(payload.get("documentation"), dict) else {}
     endpoints = payload.get("endpoints") if isinstance(payload.get("endpoints"), dict) else {}
@@ -128,7 +138,7 @@ def validate_agent(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
             or endpoint.get("endpoint")
             or endpoint.get("href")
         )
-        resolved_url = resolve_url(api_base_url or base_reference, raw_path)
+        resolved_url = resolve_openapi_path(api_base_url or base_reference, raw_path)
         auth_required = endpoint.get("auth")
         if resolved_url and auth_required is not True:
             public_endpoint_urls = merge_unique_limited(public_endpoint_urls, [resolved_url], limit=12)
@@ -215,6 +225,60 @@ def validate_agent(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
     probe_candidates = merge_probe_candidates(probe_candidates, x402_probe_candidates)
     priced_action_count += x402_priced_action_count
     payment_currency_codes = merge_unique_limited(payment_currency_codes, x402_currencies, limit=12)
+
+    extension_entries = capabilities.get("extensions") if isinstance(capabilities.get("extensions"), list) else []
+    for extension in extension_entries:
+        if not isinstance(extension, dict):
+            continue
+        params = extension.get("params") if isinstance(extension.get("params"), dict) else {}
+        pricing = params.get("pricing") if isinstance(params.get("pricing"), dict) else {}
+        endpoint_prices = pricing.get("endpoints") if isinstance(pricing.get("endpoints"), dict) else {}
+        default_currency = params.get("currency") if isinstance(params.get("currency"), str) else None
+        default_network = params.get("network") if isinstance(params.get("network"), str) else None
+        for raw_path, endpoint_price in endpoint_prices.items():
+            if not isinstance(raw_path, str) or not raw_path.strip():
+                continue
+            endpoint_url = resolve_openapi_path(api_base_url or top_level_url or base_reference, raw_path)
+            endpoint_amount = endpoint_price.get("price") if isinstance(endpoint_price, dict) else endpoint_price
+            endpoint_description = endpoint_price.get("description") if isinstance(endpoint_price, dict) else None
+            endpoint_method = "POST" if "/batch" in raw_path.lower() else "GET"
+            sample_actions = merge_action_samples(
+                sample_actions,
+                [
+                    build_action_sample(
+                        method=endpoint_method,
+                        url=endpoint_url,
+                        path=raw_path,
+                        title=raw_path.strip().rsplit("/", 1)[-1],
+                        description=endpoint_description if isinstance(endpoint_description, str) else None,
+                        amount=endpoint_amount,
+                        currency=default_currency,
+                        network=default_network,
+                        source="agent_extension",
+                    )
+                ],
+            )
+            if endpoint_amount is not None and str(endpoint_amount).strip():
+                priced_action_count += 1
+            if isinstance(default_currency, str) and default_currency.strip():
+                payment_currency_codes = merge_unique_limited(payment_currency_codes, [default_currency.strip().upper()[:12]], limit=12)
+            if isinstance(default_network, str) and default_network.strip():
+                payment_network_names = merge_unique_limited(payment_network_names, [default_network.strip()], limit=12)
+            candidate = build_probe_candidate(
+                url=endpoint_url,
+                method=endpoint_method,
+                body=endpoint_method == "POST" and {} or None,
+                content_type="application/json",
+                source="agent_extension",
+                title=endpoint_description if isinstance(endpoint_description, str) and endpoint_description.strip() else raw_path,
+                amount=endpoint_amount,
+                currency=default_currency,
+            )
+            if candidate:
+                template_parameters = extract_template_parameters(raw_path)
+                if template_parameters:
+                    candidate["template_parameters"] = template_parameters
+                probe_candidates = merge_probe_candidates(probe_candidates, [candidate])
 
     for skill in skills:
         if not isinstance(skill, dict):

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .helpers import merge_unique_limited, resolve_url
+from .helpers import merge_unique_limited, resolve_url, split_http_method_prefix
 
 
 def merge_action_samples(
@@ -356,8 +356,9 @@ def extract_x402_actions(
         if not isinstance(service, dict):
             continue
         raw_url = service.get("url") or service.get("resource") or service.get("endpoint") or service.get("path")
-        resolved_url = resolve_url(base_reference, raw_url)
-        method = service.get("method") if isinstance(service.get("method"), str) else "POST"
+        inferred_method, normalized_path = split_http_method_prefix(raw_url if isinstance(raw_url, str) else None)
+        resolved_url = resolve_url(base_reference, normalized_path or raw_url)
+        method = service.get("method") if isinstance(service.get("method"), str) else inferred_method or "POST"
         pricing = service.get("pricing") if isinstance(service.get("pricing"), dict) else {}
         amount = pricing.get("amount") or service.get("price")
         currency = pricing.get("asset") or pricing.get("currency") or service.get("currency")
@@ -376,7 +377,7 @@ def extract_x402_actions(
                 build_action_sample(
                     method=method,
                     url=resolved_url,
-                    path=raw_url if isinstance(raw_url, str) else None,
+                    path=normalized_path or raw_url if isinstance(raw_url, str) else None,
                     title=title if isinstance(title, str) else None,
                     description=description,
                     amount=amount,
@@ -389,7 +390,7 @@ def extract_x402_actions(
         candidate = build_probe_candidate(
             url=resolved_url,
             method=method,
-            body=heuristic_sample_body(resolved_url or str(raw_url), method),
+            body=heuristic_sample_body(resolved_url or str(normalized_path or raw_url), method),
             content_type="application/json",
             source=source,
             title=title if isinstance(title, str) else None,
@@ -415,8 +416,9 @@ def extract_x402_actions(
     for raw_path, endpoint in endpoint_items:
         if not isinstance(endpoint, dict):
             continue
-        resolved_url = resolve_url(base_reference, raw_path)
-        method = endpoint.get("method") if isinstance(endpoint.get("method"), str) else "POST"
+        inferred_method, normalized_path = split_http_method_prefix(raw_path)
+        resolved_url = resolve_url(base_reference, normalized_path or raw_path)
+        method = endpoint.get("method") if isinstance(endpoint.get("method"), str) else inferred_method or "POST"
         amount = endpoint.get("price") or endpoint.get("amount")
         currency = endpoint.get("currency") if isinstance(endpoint.get("currency"), str) else None
         description = endpoint.get("description") if isinstance(endpoint.get("description"), str) else None
@@ -433,7 +435,7 @@ def extract_x402_actions(
                 build_action_sample(
                     method=method,
                     url=resolved_url,
-                    path=raw_path,
+                    path=normalized_path or raw_path,
                     title=title if isinstance(title, str) else None,
                     description=description,
                     amount=amount,
@@ -445,7 +447,7 @@ def extract_x402_actions(
         candidate = build_probe_candidate(
             url=resolved_url,
             method=method,
-            body=heuristic_sample_body(resolved_url or raw_path, method),
+            body=heuristic_sample_body(resolved_url or normalized_path or raw_path, method),
             content_type="application/json",
             source=source,
             title=title if isinstance(title, str) else None,

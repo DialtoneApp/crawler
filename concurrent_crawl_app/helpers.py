@@ -12,9 +12,11 @@ from .models import FetchResponse
 
 
 TEMPLATE_PARAMETER_RE = re.compile(r"\{([^{}]+)\}")
+COLON_PARAMETER_RE = re.compile(r"(?:(?<=/)|^):([a-zA-Z_][a-zA-Z0-9_]*)")
 ABSOLUTE_URL_RE = re.compile(r"https?://[^\s<>()\"']+")
 LINK_TAG_RE = re.compile(r"<link\b[^>]*>", re.IGNORECASE)
 HTML_ATTR_RE = re.compile(r'([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*("([^"]*)"|\'([^\']*)\'|([^\s>]+))')
+HTTP_METHOD_PREFIX_RE = re.compile(r"^\s*([A-Z]+)\s+(/.*)$")
 
 
 def normalize_content_type(content_type: str | None) -> str | None:
@@ -83,6 +85,48 @@ def resolve_url(base_url: str | None, candidate: Any) -> str | None:
         return urljoin(base_url, candidate)
     except ValueError:
         return None
+
+
+def resolve_openapi_path(base_url: str | None, candidate: Any) -> str | None:
+    if not isinstance(candidate, str):
+        return None
+    candidate = candidate.strip()
+    if not candidate:
+        return None
+    if candidate.startswith(("http://", "https://")):
+        return candidate
+    if not base_url:
+        return None
+    try:
+        parsed = urlsplit(base_url)
+    except ValueError:
+        return resolve_url(base_url, candidate)
+    if not parsed.scheme or not parsed.netloc:
+        return resolve_url(base_url, candidate)
+
+    if not candidate.startswith("/"):
+        return resolve_url(base_url, candidate)
+
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    base_path = parsed.path.rstrip("/")
+    if base_path:
+        last_segment = base_path.rsplit("/", 1)[-1]
+        if "." in last_segment:
+            base_path = base_path.rsplit("/", 1)[0] if "/" in base_path else ""
+    target_path = f"{base_path}{candidate}" if base_path else candidate
+    return resolve_url(origin, target_path)
+
+
+def split_http_method_prefix(value: str | None) -> tuple[str | None, str | None]:
+    if not isinstance(value, str):
+        return None, None
+    cleaned = value.strip()
+    if not cleaned:
+        return None, None
+    match = HTTP_METHOD_PREFIX_RE.match(cleaned)
+    if not match:
+        return None, cleaned
+    return match.group(1).strip().upper(), match.group(2).strip()
 
 
 def extract_absolute_urls(text: str) -> list[str]:
@@ -188,6 +232,10 @@ def extract_template_parameters(value: str | None) -> list[str]:
         candidate = match.group(1).strip()
         if candidate and candidate not in results:
             results.append(candidate)
+    for match in COLON_PARAMETER_RE.finditer(value):
+        candidate = match.group(1).strip()
+        if candidate and candidate not in results:
+            results.append(candidate)
     return results
 
 
@@ -207,7 +255,17 @@ def fill_template_parameters(value: str | None, replacements: dict[str, Any]) ->
         cleaned = str(replacement).strip()
         return cleaned or match.group(0)
 
-    return TEMPLATE_PARAMETER_RE.sub(replace, value)
+    replaced = TEMPLATE_PARAMETER_RE.sub(replace, value)
+
+    def replace_colon(match: re.Match[str]) -> str:
+        key = match.group(1).strip()
+        replacement = replacements.get(key)
+        if replacement is None:
+            return match.group(0)
+        cleaned = str(replacement).strip()
+        return cleaned or match.group(0)
+
+    return COLON_PARAMETER_RE.sub(replace_colon, replaced)
 
 
 def is_cross_host_redirect(fetch: FetchResponse) -> bool:

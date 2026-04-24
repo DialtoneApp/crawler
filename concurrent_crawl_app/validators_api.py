@@ -13,7 +13,9 @@ from .helpers import (
     is_json_content_type,
     is_login_handoff_body,
     merge_unique_limited,
+    resolve_openapi_path,
     resolve_url,
+    split_http_method_prefix,
 )
 from .http_client import parse_json_body
 from .models import FetchResponse
@@ -130,7 +132,7 @@ def validate_openapi(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
                     [f"{method_name.upper()} {path_name}"],
                     limit=6,
                 )
-                resolved_url = resolve_url(base_reference, path_name)
+                resolved_url = resolve_openapi_path(base_reference, path_name)
                 summary = operation.get("summary") if isinstance(operation.get("summary"), str) else operation.get("operationId")
                 sample_actions = merge_action_samples(
                     sample_actions,
@@ -163,7 +165,7 @@ def validate_openapi(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
                         collection_path = path_name.split("{", 1)[0].rstrip("/")
                         collection_path_item = readable_paths.get(collection_path)
                         if isinstance(collection_path_item, dict) and isinstance(collection_path_item.get("get"), dict):
-                            discovery_url = resolve_url(base_reference, collection_path)
+                            discovery_url = resolve_openapi_path(base_reference, collection_path)
                             if discovery_url:
                                 candidate["discovery_url"] = discovery_url
                         if "discovery_url" not in candidate:
@@ -193,7 +195,7 @@ def validate_openapi(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
                                     score += 20
                                 if score <= 0:
                                     continue
-                                resolved_discovery_url = resolve_url(base_reference, candidate_path)
+                                resolved_discovery_url = resolve_openapi_path(base_reference, candidate_path)
                                 if isinstance(resolved_discovery_url, str) and resolved_discovery_url and resolved_discovery_url not in inferred_discovery_urls:
                                     inferred_discovery_urls.append(resolved_discovery_url)
                             if inferred_discovery_urls:
@@ -203,7 +205,7 @@ def validate_openapi(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
                             lookup_path = f"{resource_path}{lookup_suffix}"
                             lookup_item = readable_paths.get(lookup_path)
                             if isinstance(lookup_item, dict) and isinstance(lookup_item.get("get"), dict):
-                                price_lookup_url = resolve_url(base_reference, lookup_path)
+                                price_lookup_url = resolve_openapi_path(base_reference, lookup_path)
                                 if price_lookup_url:
                                     candidate["price_lookup_url"] = price_lookup_url
                                 break
@@ -295,22 +297,26 @@ def validate_x402(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
             primary_resource: dict[str, Any] | None = resources[0] if resources and isinstance(resources[0], dict) else None
             for resource in resources:
                 if isinstance(resource, str) and resource.strip():
-                    resource_urls = merge_unique_limited(resource_urls, [resource.strip()], limit=12)
+                    resource_method, resource_path = split_http_method_prefix(resource)
+                    candidate_url = resolve_url(base_reference, resource_path) if isinstance(resource_path, str) else None
+                    if candidate_url:
+                        resource_urls = merge_unique_limited(resource_urls, [candidate_url], limit=12)
                     sample_actions = merge_action_samples(
                         sample_actions,
                         [
                             build_action_sample(
-                                method="POST",
-                                url=resource.strip(),
-                                title=resource.strip().rsplit("/", 1)[-1],
+                                method=resource_method or "POST",
+                                url=candidate_url,
+                                path=resource_path,
+                                title=(resource_path or resource.strip()).rsplit("/", 1)[-1],
                                 source="x402",
                             )
                         ],
                     )
                     candidate = build_probe_candidate(
-                        url=resource.strip(),
-                        method="POST",
-                        body=heuristic_sample_body(resource.strip(), "POST"),
+                        url=candidate_url,
+                        method=resource_method or "POST",
+                        body=heuristic_sample_body(candidate_url or resource_path or resource.strip(), resource_method or "POST"),
                         content_type="application/json",
                         source="x402",
                     )
