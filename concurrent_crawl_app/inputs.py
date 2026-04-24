@@ -90,6 +90,29 @@ def normalize_domain(value: str) -> str | None:
         return None
 
 
+def parse_rank_and_candidate(row: list[str]) -> tuple[int | None, str | None]:
+    if not row:
+        return None, None
+
+    if len(row) > 1 and row[0].strip().isdigit():
+        return int(row[0].strip()), row[1]
+
+    raw = row[0].strip()
+    if not raw:
+        return None, None
+
+    if "\t" in raw:
+        tab_parts = [part.strip() for part in raw.split("\t") if part.strip()]
+        if len(tab_parts) >= 2 and tab_parts[0].isdigit():
+            return int(tab_parts[0]), tab_parts[1]
+
+    whitespace_parts = raw.split(None, 1)
+    if len(whitespace_parts) == 2 and whitespace_parts[0].isdigit():
+        return int(whitespace_parts[0]), whitespace_parts[1]
+
+    return None, raw
+
+
 def iter_domains(csv_path: Path) -> Iterator[DomainInput]:
     with csv_path.open(newline="", encoding="utf-8", errors="replace") as csv_file:
         reader = csv.reader(csv_file)
@@ -97,11 +120,9 @@ def iter_domains(csv_path: Path) -> Iterator[DomainInput]:
             if not row:
                 continue
 
-            rank = None
-            candidate = row[0]
-            if len(row) > 1 and row[0].strip().isdigit():
-                rank = int(row[0].strip())
-                candidate = row[1]
+            rank, candidate = parse_rank_and_candidate(row)
+            if not candidate:
+                continue
 
             domain = normalize_domain(candidate)
             if domain:
