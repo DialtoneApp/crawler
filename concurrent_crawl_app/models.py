@@ -70,6 +70,7 @@ class CrawlReceipt:
     title: str | None
     probes: dict[str, ProbeOutcome]
     aggregates: dict[str, Any] = field(default_factory=dict)
+    artifacts: dict[str, bytes] = field(default_factory=dict, repr=False, compare=False)
 
 
 @dataclass

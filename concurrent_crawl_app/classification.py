@@ -93,6 +93,88 @@ def best_valid_outcome(outcomes: dict[str, ProbeOutcome], keys: tuple[str, ...])
     return None
 
 
+def infer_purchase_boundary(
+    *,
+    tags: list[str],
+    products: ProbeOutcome | None,
+    commerce: ProbeOutcome | None,
+    payment_probe: ProbeOutcome | None,
+) -> str:
+    probe_result = payment_probe.facts.get("probe_result") if payment_probe and payment_probe.status == "valid" else None
+    if probe_result == "payment_challenge":
+        return "payment_challenge"
+    if probe_result == "success_without_payment":
+        return "optional_or_prepaid_payment"
+    if probe_result == "auth_or_method_boundary":
+        return "auth_boundary"
+    if probe_result == "input_validation":
+        return "input_validation_boundary"
+
+    if commerce and commerce.status == "valid":
+        checkout_url = commerce.facts.get("checkout_url")
+        purchase_intent_url_count = int(commerce.facts.get("purchase_intent_url_count") or 0)
+        priced_offer_count = int(commerce.facts.get("priced_offer_count") or 0)
+        if isinstance(checkout_url, str) and checkout_url:
+            return "checkout_redirect"
+        if priced_offer_count > 0 and purchase_intent_url_count > 0:
+            return "purchase_intent_documented"
+        if priced_offer_count > 0:
+            return "offer_documented"
+
+    if products and products.status == "valid":
+        return "catalog_only"
+    if "ai_readable" in tags:
+        return "read_only"
+    if "crawl_basics" in tags:
+        return "crawl_only"
+    return "unknown"
+
+
+def infer_control_boundary(
+    *,
+    payment_surface: str | None,
+    crypto_only: bool,
+    purchase_intent_auth: str | None,
+    openapi_auth_schemes: list[str],
+    payment_probe: ProbeOutcome | None,
+    browser_checkout_surface: bool,
+) -> str:
+    probe_result = payment_probe.facts.get("probe_result") if payment_probe and payment_probe.status == "valid" else None
+
+    auth_value = normalize_status_value(purchase_intent_auth)
+    if auth_value in {"wallet", "siwx", "http_signatures"}:
+        return "wallet_required"
+    if auth_value in {"oauth2", "bearer", "token", "api_key", "apikey", "auth"}:
+        return "token_required"
+
+    if probe_result == "success_without_payment":
+        return "none"
+    if probe_result == "payment_challenge":
+        if payment_surface == "saved_card_authority":
+            return "owner_preauthorized_card"
+        if crypto_only:
+            return "wallet_required"
+        return "payment_required"
+    if probe_result == "auth_or_method_boundary":
+        if crypto_only:
+            return "wallet_required"
+        if openapi_auth_schemes:
+            return "token_required"
+        return "auth_required"
+    if probe_result == "input_validation":
+        return "input_required"
+
+    if payment_surface == "saved_card_authority":
+        return "owner_preauthorized_card"
+    if crypto_only:
+        return "wallet_required"
+    if openapi_auth_schemes:
+        return "token_required"
+    if browser_checkout_surface:
+        return "human_checkout"
+    return "unknown"
+
+
 def merge_agent_facts(outcomes: dict[str, ProbeOutcome]) -> dict[str, Any]:
     merged: dict[str, Any] = {}
     list_keys = {
@@ -173,9 +255,13 @@ def classify_receipt(
     payment_endpoint_hosts: list[str] = []
     payment_surface: str | None = None
     crypto_only = False
+    verified_payment_surface = False
     commerce_docs_claim_machine_payable = False
     sample_actions: list[dict[str, Any]] = []
     priced_action_count = 0
+    openapi_auth_schemes: list[str] = []
+    purchase_intent_auth: str | None = None
+    browser_checkout_surface = False
 
     if "llms_txt" in valid_keys or "llms_full_txt" in valid_keys:
         tags.append("ai_readable")
@@ -247,6 +333,11 @@ def classify_receipt(
 
     openapi = best_valid_outcome(outcomes, ("openapi_json", "api_openapi_json"))
     if openapi and openapi.status == "valid":
+        openapi_auth_schemes = [
+            value
+            for value in openapi.facts.get("auth_schemes", [])
+            if isinstance(value, str) and value
+        ]
         for key in (
             "path_count",
             "auth_schemes",
@@ -356,6 +447,7 @@ def classify_receipt(
             tags.append("prelaunch_offer_surface")
         if isinstance(commerce.facts.get("checkout_url"), str) and commerce.facts.get("checkout_url"):
             tags.append("browser_checkout_surface")
+            browser_checkout_surface = True
         payment_provider_hints = merge_unique_limited(
             payment_provider_hints,
             commerce.facts.get("payment_provider_hints", []) if isinstance(commerce.facts.get("payment_provider_hints"), list) else [],
@@ -574,6 +666,7 @@ def classify_receipt(
         if payment_probe.facts.get("probe_result") in {"payment_challenge", "success_without_payment"}:
             tags.append("machine_payable")
             tags.append("verified_payment_surface")
+            verified_payment_surface = True
         if payment_probe.facts.get("probe_result") == "success_without_payment":
             tags.append("free_tier_or_optional_payment")
 
@@ -599,6 +692,23 @@ def classify_receipt(
         aggregates["payment_surface"] = payment_surface
     if payment_surface or payment_provider_hints or payment_rail_hints:
         aggregates["crypto_only"] = crypto_only
+    purchase_boundary = infer_purchase_boundary(
+        tags=tags,
+        products=products,
+        commerce=commerce,
+        payment_probe=payment_probe,
+    )
+    control_boundary = infer_control_boundary(
+        payment_surface=payment_surface,
+        crypto_only=crypto_only,
+        purchase_intent_auth=purchase_intent_auth,
+        openapi_auth_schemes=openapi_auth_schemes,
+        payment_probe=payment_probe,
+        browser_checkout_surface=browser_checkout_surface,
+    )
+    aggregates["purchase_boundary"] = purchase_boundary
+    aggregates["control_boundary"] = control_boundary
+    aggregates["verified_payment_surface"] = verified_payment_surface
 
     if "machine_payable" in tags:
         label = "machine_payable"

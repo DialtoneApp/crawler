@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from typing import Any
 
 from .classification import classify_receipt, merge_agent_facts, should_probe_products
@@ -11,6 +12,8 @@ from .models import DomainInput, FetchResponse, ProbeOutcome, ProbeSpec
 from .outcomes import build_outcome, merge_ucp_facts
 from .ucp_catalog import probe_ucp_catalog_products
 from .validators_content import validate_ucp
+
+STORED_ARTIFACT_KEYS = frozenset({"robots_txt", "llms_txt", "llms_full_txt"})
 
 
 def build_dynamic_probe_outcome(
@@ -413,6 +416,7 @@ def probe_domain(domain_input: DomainInput, timeout: float, run_token: str):
     domain = domain_input.domain
     outcomes: dict[str, ProbeOutcome] = {}
     control_cache: dict[str, FetchResponse] = {}
+    artifacts: dict[str, bytes] = {}
 
     homepage_spec = BASE_PROBES[0]
     homepage_fetch = fetch_url(f"https://{domain}{homepage_spec.path}", timeout=timeout, max_bytes=homepage_spec.max_bytes)
@@ -438,14 +442,22 @@ def probe_domain(domain_input: DomainInput, timeout: float, run_token: str):
             content_type=None,
             detail="Skipped after homepage network failure",
         )
-        return classify_receipt(domain_input, outcomes)
+        return replace(classify_receipt(domain_input, outcomes), artifacts=artifacts)
 
     for spec in BASE_PROBES[1:]:
         fetch = fetch_url(f"https://{domain}{spec.path}", timeout=timeout, max_bytes=spec.max_bytes)
         control = None
         if spec.control_group and fetch.status == 200:
             control = build_control_fetch(domain, spec.control_group, run_token, timeout, control_cache)
-        outcomes[spec.key] = build_outcome(spec, fetch, control)
+        outcome = build_outcome(spec, fetch, control)
+        outcomes[spec.key] = outcome
+        if (
+            spec.key in STORED_ARTIFACT_KEYS
+            and outcome.status == "valid"
+            and not fetch.truncated
+            and fetch.body
+        ):
+            artifacts[spec.key] = fetch.body
 
     root_ucp_outcome = outcomes.get("well_known_ucp")
     if root_ucp_outcome and root_ucp_outcome.status == "valid":
@@ -681,4 +693,4 @@ def probe_domain(domain_input: DomainInput, timeout: float, run_token: str):
                 detail=payment_probe_skip_detail,
             )
 
-    return classify_receipt(domain_input, outcomes)
+    return replace(classify_receipt(domain_input, outcomes), artifacts=artifacts)

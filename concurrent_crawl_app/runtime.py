@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 import time
 from collections import Counter
@@ -14,6 +15,12 @@ from .inputs import iter_domains_from_offset, iter_limited, parse_args
 from .models import CrawlReceipt, DomainInput, ReceiptShardState
 from .outcomes import serialize_receipt
 from .probe import probe_domain
+
+ARTIFACT_FILE_NAMES = {
+    "robots_txt": "robots.txt",
+    "llms_txt": "llms.txt",
+    "llms_full_txt": "llms-full.txt",
+}
 
 
 def submit_next(
@@ -140,6 +147,33 @@ def has_interesting_signal(receipt: CrawlReceipt) -> bool:
     )
 
 
+def write_receipt_artifacts(evidence_dir: Path, receipt: CrawlReceipt) -> None:
+    domain_dir = evidence_dir / receipt.domain
+    if domain_dir.exists():
+        try:
+            shutil.rmtree(domain_dir)
+        except OSError:
+            pass
+    if not receipt.artifacts:
+        return
+    domain_dir.mkdir(parents=True, exist_ok=True)
+    for artifact_key, body in receipt.artifacts.items():
+        file_name = ARTIFACT_FILE_NAMES.get(artifact_key)
+        if not file_name or not isinstance(body, bytes) or not body:
+            continue
+        (domain_dir / file_name).write_bytes(body)
+
+
+def remove_receipt_artifacts(evidence_dir: Path, domain: str) -> None:
+    domain_dir = evidence_dir / domain
+    if not domain_dir.exists():
+        return
+    try:
+        shutil.rmtree(domain_dir)
+    except OSError:
+        pass
+
+
 def build_checkpoint_payload(
     *,
     completed: int,
@@ -167,6 +201,7 @@ def crawl(args) -> int:
     results_dir = Path(args.results_dir)
     receipts_dir = results_dir / "receipts"
     positives_dir = results_dir / "positives"
+    evidence_dir = results_dir / "evidence"
     checkpoint_path = results_dir / "checkpoint.json"
 
     if args.concurrency < 1:
@@ -185,6 +220,7 @@ def crawl(args) -> int:
     results_dir.mkdir(parents=True, exist_ok=True)
     receipts_dir.mkdir(parents=True, exist_ok=True)
     positives_dir.mkdir(parents=True, exist_ok=True)
+    evidence_dir.mkdir(parents=True, exist_ok=True)
 
     checkpoint = None if args.no_resume else load_checkpoint(checkpoint_path)
     start_row_index = int(checkpoint.get("next_row_index", 0)) if checkpoint else 0
@@ -274,12 +310,16 @@ def crawl(args) -> int:
                             json.dumps(serialized, indent=2, sort_keys=True),
                             encoding="utf-8",
                         )
+                        write_receipt_artifacts(evidence_dir, receipt)
                         print(f"FOUND {receipt.domain} {receipt.label} {','.join(interesting_keys)}")
                     elif positive_path.exists():
                         try:
                             positive_path.unlink()
                         except OSError:
                             pass
+                        remove_receipt_artifacts(evidence_dir, receipt.domain)
+                    else:
+                        remove_receipt_artifacts(evidence_dir, receipt.domain)
 
                     if args.progress_every and completed % args.progress_every == 0:
                         elapsed = max(time.monotonic() - started_at, 0.001)
