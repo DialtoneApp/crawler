@@ -7,6 +7,7 @@ from .helpers import (
     collect_payment_hints,
     decode_json_like_header,
     decode_body,
+    extract_observed_json_schema_facts,
     extract_template_parameters,
     extract_title,
     is_generic_error_fallback_body,
@@ -64,6 +65,7 @@ def validate_openapi(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
 
     if not isinstance(payload, dict):
         return False, "OpenAPI payload was not an object", {}
+    observed_schema_facts = extract_observed_json_schema_facts(payload)
 
     version = payload.get("openapi") or payload.get("swagger")
     paths = payload.get("paths")
@@ -224,6 +226,7 @@ def validate_openapi(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
         "payment_signature_header_count": payment_signature_header_count,
         "sample_actions": sample_actions,
         "payment_probe_candidates": probe_candidates,
+        **observed_schema_facts,
     }
 
 
@@ -269,6 +272,7 @@ def validate_x402(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
             return False, f"invalid json: {error.msg}", {}
 
         if isinstance(payload, dict):
+            observed_schema_facts = extract_observed_json_schema_facts(payload)
             keys = set(str(key) for key in payload.keys())
             keys_lower = {key.strip().lower() for key in keys}
             challenge_context = fetch.status == 402 or bool(payment_required_header) or bool(www_authenticate_header)
@@ -544,12 +548,14 @@ def validate_x402(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
                 "payment_endpoint_hosts": merged_endpoint_hosts,
                 "payment_surface": merged_payment_surface,
                 "crypto_only": merged_crypto_only,
+                **observed_schema_facts,
             }
             if isinstance(payment_required_payload, dict):
                 facts["payment_required_header_keys"] = sorted(str(key) for key in payment_required_payload.keys())[:12]
             return True, "x402-like JSON detected", facts
 
         if isinstance(payload, list) and payload:
+            observed_schema_facts = extract_observed_json_schema_facts(payload)
             matching_item_count = 0
             for item in payload[:20]:
                 if not isinstance(item, dict):
@@ -567,6 +573,7 @@ def validate_x402(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
             return True, "x402-like JSON list detected", {
                 "item_count": len(payload),
                 "matching_item_count": matching_item_count,
+                **observed_schema_facts,
             }
 
         return False, "x402 payload was empty or unsupported", {}

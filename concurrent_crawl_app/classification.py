@@ -6,6 +6,22 @@ from typing import Any
 from .helpers import decode_body, merge_unique_limited, normalize_status_value
 from .models import CrawlReceipt, DomainInput, ProbeOutcome
 
+OBSERVED_SCHEMA_FACT_KEYS = (
+    "observed_capability_names",
+    "observed_payment_protocols",
+    "observed_payment_methods",
+    "observed_payment_providers",
+    "observed_payment_handler_names",
+    "observed_payment_assets",
+    "observed_payment_networks",
+    "observed_payment_flow_types",
+    "observed_payment_requirement_keys",
+    "observed_catalog_endpoints",
+    "observed_quote_endpoints",
+    "observed_checkout_endpoints",
+    "observed_order_status_endpoints",
+)
+
 
 def merge_action_samples(
     existing: list[dict[str, Any]],
@@ -38,6 +54,22 @@ def merge_action_samples(
         if len(merged) >= limit:
             break
     return merged[:limit]
+
+
+def merge_observed_schema_facts(outcomes: dict[str, ProbeOutcome]) -> dict[str, list[str]]:
+    merged: dict[str, list[str]] = {}
+    for outcome in outcomes.values():
+        if outcome.status != "valid":
+            continue
+        for fact_key in OBSERVED_SCHEMA_FACT_KEYS:
+            values = outcome.facts.get(fact_key)
+            if isinstance(values, list) and values:
+                merged[fact_key] = merge_unique_limited(
+                    merged.get(fact_key, []),
+                    [value for value in values if isinstance(value, str)],
+                    limit=12,
+                )
+    return merged
 
 
 def should_probe_products(homepage_fetch: Any, homepage_outcome: ProbeOutcome, outcomes: dict[str, ProbeOutcome]) -> bool:
@@ -547,6 +579,11 @@ def classify_receipt(
 
     if commerce_docs_claim_machine_payable:
         tags.append("machine_payable")
+
+    observed_schema_facts = merge_observed_schema_facts(outcomes)
+    for fact_key, values in observed_schema_facts.items():
+        if values:
+            aggregates[fact_key] = values
 
     if sample_actions:
         aggregates["sample_actions"] = sample_actions

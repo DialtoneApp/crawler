@@ -7,6 +7,7 @@ from .helpers import (
     collect_payment_hints,
     decode_body,
     derive_x402_discovery_url,
+    extract_observed_json_schema_facts,
     extract_absolute_urls,
     extract_link_urls_by_rel,
     extract_title,
@@ -163,6 +164,7 @@ def validate_commerce(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
 
         if not isinstance(payload, (dict, list)):
             return False, "commerce payload was not an object or list", {}
+        observed_schema_facts = extract_observed_json_schema_facts(payload)
         if isinstance(payload, dict):
             keys = sorted(str(key) for key in payload.keys())
             if not any(key in interesting for key in payload.keys()):
@@ -331,6 +333,7 @@ def validate_commerce(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
                     and not ({"saved_card", "card", "digital_wallet", "x402"} & set(live_payment_rail_hints or nonlive_payment_rail_hints))
                 ),
                 "prelaunch": is_prelaunch_status(commerce_status) or is_prelaunch_status(billing_provider_status),
+                **observed_schema_facts,
             }
             return True, "Structured commerce JSON detected", facts
         matching_item_count = 0
@@ -344,6 +347,7 @@ def validate_commerce(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
         return True, "Structured commerce list detected", {
             "item_count": len(payload),
             "matching_item_count": matching_item_count,
+            **observed_schema_facts,
         }
 
     lower_text = text.lower()
@@ -472,6 +476,7 @@ def validate_ucp(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
         }
 
     payment_hints = collect_payment_hints(payload)
+    observed_schema_facts = extract_observed_json_schema_facts(payload)
 
     return True, "Valid UCP document detected", {
         "ucp_version": version,
@@ -484,5 +489,6 @@ def validate_ucp(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
         "payment_endpoint_samples": sorted(set(payment_endpoints))[:6],
         "shopping_mcp_endpoints": shopping_mcp_endpoints,
         "current_version_url": current_version_url,
+        **observed_schema_facts,
         **payment_hints,
     }

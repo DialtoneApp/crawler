@@ -6,6 +6,7 @@ from typing import Any
 from .helpers import (
     collect_payment_hints,
     derive_x402_discovery_url,
+    extract_observed_json_schema_facts,
     extract_template_parameters,
     final_host,
     merge_unique_limited,
@@ -62,6 +63,7 @@ def validate_agent(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
 
     if not isinstance(payload, dict):
         return False, "agent payload was not an object", {}
+    observed_schema_facts = extract_observed_json_schema_facts(payload)
 
     keys = set(payload.keys())
     expected = {
@@ -331,6 +333,7 @@ def validate_agent(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
         "sample_actions": sample_actions,
         "priced_action_count": priced_action_count,
         "payment_probe_candidates": probe_candidates,
+        **observed_schema_facts,
         **payment_hints,
     }
 
@@ -345,6 +348,7 @@ def validate_agents(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
         return False, str(error), {}
     except json.JSONDecodeError as error:
         return False, f"invalid json: {error.msg}", {}
+    observed_schema_facts = extract_observed_json_schema_facts(payload)
 
     if isinstance(payload, dict):
         keys = set(payload.keys())
@@ -356,9 +360,9 @@ def validate_agents(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
             value = payload.get(key)
             if isinstance(value, list):
                 count += len(value)
-        return True, "Agents/workflows JSON detected", {"entry_count": count}
+        return True, "Agents/workflows JSON detected", {"entry_count": count, **observed_schema_facts}
 
     if isinstance(payload, list):
-        return True, "Agents/workflows list detected", {"entry_count": len(payload)}
+        return True, "Agents/workflows list detected", {"entry_count": len(payload), **observed_schema_facts}
 
     return False, "agents payload was not an object or list", {}

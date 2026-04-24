@@ -545,6 +545,215 @@ def collect_payment_hints(value: Any) -> dict[str, Any]:
     }
 
 
+def extract_observed_json_schema_facts(payload: Any) -> dict[str, Any]:
+    observed: dict[str, list[str]] = {
+        "observed_capability_names": [],
+        "observed_payment_protocols": [],
+        "observed_payment_methods": [],
+        "observed_payment_providers": [],
+        "observed_payment_handler_names": [],
+        "observed_payment_assets": [],
+        "observed_payment_networks": [],
+        "observed_payment_flow_types": [],
+        "observed_payment_requirement_keys": [],
+        "observed_catalog_endpoints": [],
+        "observed_quote_endpoints": [],
+        "observed_checkout_endpoints": [],
+        "observed_order_status_endpoints": [],
+    }
+
+    def add_value(key: str, value: Any, *, upper: bool = False, limit: int = 12) -> None:
+        if not isinstance(value, str):
+            return
+        cleaned = value.strip()
+        if not cleaned:
+            return
+        if upper:
+            cleaned = cleaned.upper()
+        observed[key] = merge_unique_limited(observed.get(key, []), [cleaned], limit=limit)
+
+    def add_many(key: str, values: Any, *, upper: bool = False, limit: int = 12) -> None:
+        if isinstance(values, list):
+            for item in values[:20]:
+                if isinstance(item, str):
+                    add_value(key, item, upper=upper, limit=limit)
+                elif isinstance(item, dict):
+                    for candidate_key in ("name", "id", "value", "method", "asset", "currency", "network"):
+                        candidate_value = item.get(candidate_key)
+                        if isinstance(candidate_value, str):
+                            add_value(key, candidate_value, upper=upper, limit=limit)
+        elif isinstance(values, str):
+            add_value(key, values, upper=upper, limit=limit)
+
+    def endpoint_value(candidate: Any) -> str | None:
+        if isinstance(candidate, str):
+            cleaned = candidate.strip()
+            return cleaned or None
+        if isinstance(candidate, dict):
+            for endpoint_key in ("endpoint", "url", "href", "path"):
+                endpoint_candidate = candidate.get(endpoint_key)
+                if isinstance(endpoint_candidate, str) and endpoint_candidate.strip():
+                    return endpoint_candidate.strip()
+        return None
+
+    def process_capabilities(value: Any) -> None:
+        if isinstance(value, dict):
+            for capability_name in list(value.keys())[:20]:
+                if isinstance(capability_name, str):
+                    add_value("observed_capability_names", capability_name)
+            return
+        if isinstance(value, list):
+            for item in value[:30]:
+                if isinstance(item, str):
+                    add_value("observed_capability_names", item)
+                elif isinstance(item, dict):
+                    for candidate_key in ("name", "id"):
+                        candidate_value = item.get(candidate_key)
+                        if isinstance(candidate_value, str):
+                            add_value("observed_capability_names", candidate_value)
+                            break
+
+    def process_provider_entries(value: Any, *, handler_mode: bool) -> None:
+        if isinstance(value, dict):
+            entries = []
+            for entry_name, entry_value in list(value.items())[:20]:
+                if isinstance(entry_value, dict):
+                    entry_payload = dict(entry_value)
+                    if "name" not in entry_payload and isinstance(entry_name, str):
+                        entry_payload["name"] = entry_name
+                    entries.append(entry_payload)
+                elif isinstance(entry_name, str):
+                    entries.append({"name": entry_name})
+        elif isinstance(value, list):
+            entries = value[:20]
+        else:
+            return
+
+        for entry in entries:
+            if isinstance(entry, str):
+                target_key = "observed_payment_handler_names" if handler_mode else "observed_payment_providers"
+                add_value(target_key, entry)
+                continue
+            if not isinstance(entry, dict):
+                continue
+            name_value = entry.get("name")
+            if isinstance(name_value, str):
+                target_key = "observed_payment_handler_names" if handler_mode else "observed_payment_providers"
+                add_value(target_key, name_value)
+            add_many("observed_payment_methods", entry.get("supported_methods"))
+            add_many("observed_payment_methods", entry.get("payment_methods"))
+            add_many("observed_payment_assets", entry.get("supported_assets"), upper=True)
+            add_many("observed_payment_assets", entry.get("assets"), upper=True)
+            add_many("observed_payment_assets", entry.get("currencies"), upper=True)
+            add_many("observed_payment_networks", entry.get("networks"))
+            protocol_value = entry.get("protocol")
+            if isinstance(protocol_value, str):
+                add_value("observed_payment_protocols", protocol_value.upper())
+
+    def process_payment_block(value: Any) -> None:
+        if not isinstance(value, dict):
+            return
+        protocol_value = value.get("protocol")
+        if isinstance(protocol_value, str):
+            add_value("observed_payment_protocols", protocol_value.upper())
+        flow = value.get("flow")
+        if isinstance(flow, dict):
+            flow_type = flow.get("type")
+            if isinstance(flow_type, str):
+                add_value("observed_payment_flow_types", flow_type)
+        requirements = value.get("requirements")
+        if isinstance(requirements, dict):
+            for requirement_key in list(requirements.keys())[:20]:
+                if isinstance(requirement_key, str):
+                    add_value("observed_payment_requirement_keys", requirement_key)
+        add_many("observed_payment_methods", value.get("payment_methods"))
+        add_many("observed_payment_methods", value.get("supported_methods"))
+        add_many("observed_payment_assets", value.get("supported_assets"), upper=True)
+        add_many("observed_payment_assets", value.get("assets"), upper=True)
+        add_many("observed_payment_assets", value.get("currencies"), upper=True)
+        add_many("observed_payment_networks", value.get("networks"))
+        process_provider_entries(value.get("payment_providers"), handler_mode=False)
+        process_provider_entries(value.get("providers"), handler_mode=False)
+        process_provider_entries(value.get("payment_handlers"), handler_mode=True)
+        process_provider_entries(value.get("handlers"), handler_mode=True)
+
+    def process_endpoints(value: Any) -> None:
+        if not isinstance(value, dict):
+            return
+        endpoint_roles = {
+            "catalog": "observed_catalog_endpoints",
+            "quote": "observed_quote_endpoints",
+            "checkout": "observed_checkout_endpoints",
+            "order_status": "observed_order_status_endpoints",
+            "order-status": "observed_order_status_endpoints",
+            "orderstatus": "observed_order_status_endpoints",
+        }
+        for raw_key, raw_value in list(value.items())[:30]:
+            if not isinstance(raw_key, str):
+                continue
+            normalized_key = raw_key.strip().lower().replace(" ", "_")
+            target_key = endpoint_roles.get(normalized_key)
+            if not target_key:
+                continue
+            resolved_value = endpoint_value(raw_value)
+            if resolved_value:
+                add_value(target_key, resolved_value, limit=8)
+
+    def walk(value: Any, *, path: tuple[str, ...] = (), depth: int = 0) -> None:
+        if depth > 7:
+            return
+        if isinstance(value, dict):
+            normalized_items: list[tuple[str, Any]] = []
+            for raw_key, raw_value in list(value.items())[:40]:
+                if isinstance(raw_key, str):
+                    normalized_items.append((raw_key.strip().lower(), raw_value))
+
+            if "capabilities" in {key for key, _ in normalized_items}:
+                for key, item in normalized_items:
+                    if key == "capabilities":
+                        process_capabilities(item)
+            if "payment" in {key for key, _ in normalized_items}:
+                for key, item in normalized_items:
+                    if key == "payment":
+                        process_payment_block(item)
+            if "endpoints" in {key for key, _ in normalized_items}:
+                for key, item in normalized_items:
+                    if key == "endpoints":
+                        process_endpoints(item)
+
+            path_set = set(path)
+            for key, item in normalized_items:
+                in_payment_context = bool(path_set & {"payment", "payments", "payment_provider", "payment_providers", "payment_handler", "payment_handlers"})
+                if key == "protocol" and in_payment_context and isinstance(item, str):
+                    add_value("observed_payment_protocols", item.upper())
+                elif key in {"payment_methods", "supported_methods"}:
+                    add_many("observed_payment_methods", item)
+                elif key in {"supported_assets", "assets", "currencies"} and in_payment_context:
+                    add_many("observed_payment_assets", item, upper=True)
+                elif key in {"networks", "supported_networks"} and in_payment_context:
+                    add_many("observed_payment_networks", item)
+                elif key == "requirements" and in_payment_context and isinstance(item, dict):
+                    for requirement_key in list(item.keys())[:20]:
+                        if isinstance(requirement_key, str):
+                            add_value("observed_payment_requirement_keys", requirement_key)
+                elif key == "flow" and in_payment_context and isinstance(item, dict):
+                    flow_type = item.get("type")
+                    if isinstance(flow_type, str):
+                        add_value("observed_payment_flow_types", flow_type)
+                elif key in {"payment_providers", "providers"} and (in_payment_context or key == "payment_providers"):
+                    process_provider_entries(item, handler_mode=False)
+                elif key in {"payment_handlers", "handlers"} and (in_payment_context or key == "payment_handlers"):
+                    process_provider_entries(item, handler_mode=True)
+                walk(item, path=path + (key,), depth=depth + 1)
+            return
+        if isinstance(value, list):
+            for item in value[:40]:
+                walk(item, path=path, depth=depth + 1)
+
+    walk(payload)
+    return {key: value for key, value in observed.items() if value}
+
+
 def normalize_status_value(value: Any) -> str | None:
     if not isinstance(value, str):
         return None

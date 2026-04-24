@@ -40,7 +40,7 @@ def merge_ucp_facts(primary: dict[str, Any], enriched: dict[str, Any]) -> dict[s
             "payment_provider_hints",
             "payment_rail_hints",
             "payment_endpoint_hosts",
-        }:
+        } or key.startswith("observed_"):
             primary_list = merged.get(key) if isinstance(merged.get(key), list) else []
             new_list = value if isinstance(value, list) else []
             merged[key] = sorted(dict.fromkeys(primary_list + new_list))[:12]
