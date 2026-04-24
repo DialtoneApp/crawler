@@ -409,6 +409,7 @@ def classify_receipt(
             crypto_only = True
 
     x402 = best_valid_outcome(outcomes, ("x402_json", "x402_well_known", "remote_x402"))
+    x402_has_actionable_surface = False
     if x402 and x402.status == "valid":
         for key in (
             "resource_urls",
@@ -451,8 +452,23 @@ def classify_receipt(
             sample_actions = merge_action_samples(sample_actions, x402.facts["sample_actions"])
         if int(x402.facts.get("priced_action_count") or 0) > priced_action_count:
             priced_action_count = int(x402.facts.get("priced_action_count") or 0)
+        x402_has_actionable_surface = bool(
+            int(x402.facts.get("accept_count") or 0) > 0
+            or int(x402.facts.get("resource_url_count") or 0) > 0
+            or int(x402.facts.get("priced_action_count") or 0) > 0
+            or (
+                isinstance(x402.facts.get("sample_actions"), list)
+                and len(x402.facts["sample_actions"]) > 0
+            )
+            or (
+                isinstance(x402.facts.get("payment_probe_candidates"), list)
+                and len(x402.facts["payment_probe_candidates"]) > 0
+            )
+            or bool(x402.facts.get("payment_required_header_present"))
+            or bool(x402.facts.get("www_authenticate_present"))
+        )
 
-    if {"x402_json", "x402_well_known", "remote_x402"} & valid_keys:
+    if x402_has_actionable_surface:
         payment_provider_hints = merge_unique_limited(payment_provider_hints, ["x402"], limit=12)
         payment_rail_hints = merge_unique_limited(payment_rail_hints, ["x402"], limit=12)
         payment_surface = "x402"

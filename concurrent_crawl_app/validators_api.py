@@ -14,6 +14,7 @@ from .helpers import (
     is_json_content_type,
     is_login_handoff_body,
     looks_like_html_fragment,
+    looks_like_markup_fragment,
     merge_unique_limited,
     resolve_openapi_path,
     resolve_url,
@@ -269,9 +270,84 @@ def validate_x402(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
 
         if isinstance(payload, dict):
             keys = set(str(key) for key in payload.keys())
-            expected = {"x402", "accepts", "payment", "payment_required", "network", "resource", "price", "currencies"}
-            if "x402" not in lower_text and not (keys & expected):
-                return False, "x402 JSON lacked x402/payment-like keys", {"top_level_keys": sorted(keys)[:12]}
+            keys_lower = {key.strip().lower() for key in keys}
+            challenge_context = fetch.status == 402 or bool(payment_required_header) or bool(www_authenticate_header)
+            discovery_keys = {
+                "accepts",
+                "currencies",
+                "endpoint",
+                "endpoints",
+                "extensions",
+                "payment",
+                "payment_required",
+                "resource",
+                "resources",
+                "service",
+                "services",
+            }
+            challenge_keys = discovery_keys | {
+                "amount",
+                "asset",
+                "basepriceusd",
+                "basetotalpriceusd",
+                "beneficiary",
+                "catalogdescription",
+                "catalogtitle",
+                "currency",
+                "discountbps",
+                "discountedpriceusd",
+                "discountpercent",
+                "externalurl",
+                "price",
+                "prices",
+                "recipient",
+            }
+            has_structured_x402_keys = bool(
+                "x402" in keys_lower
+                or "x402version" in keys_lower
+                or "x402_version" in keys_lower
+                or (keys_lower & (challenge_keys if challenge_context else discovery_keys))
+            )
+            generic_error_keys = {
+                "code",
+                "contribution",
+                "details",
+                "error",
+                "errors",
+                "message",
+                "path",
+                "status",
+                "statuscode",
+                "timestamp",
+                "type",
+            }
+            looks_like_generic_error = False
+            if not has_structured_x402_keys and (keys_lower & {"error", "errors", "message", "status", "statuscode", "type", "code"}):
+                status_code = payload.get("statusCode")
+                status_value = payload.get("status")
+                type_value = payload.get("type")
+                message_value = payload.get("message")
+                if isinstance(status_code, int) and status_code >= 400:
+                    looks_like_generic_error = True
+                elif isinstance(status_value, str):
+                    normalized_status = status_value.strip().lower()
+                    if normalized_status.isdigit() and int(normalized_status) >= 400:
+                        looks_like_generic_error = True
+                    elif normalized_status in {"error", "forbidden", "not found", "not_found", "not-found"}:
+                        looks_like_generic_error = True
+                if isinstance(type_value, str) and any(token in type_value.lower() for token in ("error", "forbidden", "not_found", "not-found")):
+                    looks_like_generic_error = True
+                if isinstance(message_value, str) and any(
+                    token in message_value.lower()
+                    for token in ("forbidden", "not found", "no route matches", "does not exist")
+                ):
+                    looks_like_generic_error = True
+                if not looks_like_generic_error and not (keys_lower - generic_error_keys):
+                    looks_like_generic_error = True
+            if looks_like_generic_error:
+                return False, "x402 JSON looked like a generic error response", {"top_level_keys": sorted(keys)[:12]}
+            if not has_structured_x402_keys:
+                return False, "x402 JSON lacked structured payment evidence", {"top_level_keys": sorted(keys)[:12]}
             accepts = payload.get("accepts") if isinstance(payload.get("accepts"), list) else []
             resources = payload.get("resources") if isinstance(payload.get("resources"), list) else []
             if isinstance(payload.get("resource"), dict):
@@ -420,6 +496,17 @@ def validate_x402(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
                     accept_assets = merge_unique_limited(accept_assets, [asset.strip()], limit=12)
                 if isinstance(name, str) and name.strip():
                     accept_currencies = merge_unique_limited(accept_currencies, [name.strip().upper()[:16]], limit=12)
+            has_actionable_surface = bool(
+                accepts
+                or resources
+                or sample_actions
+                or probe_candidates
+                or payment_required_header
+                or www_authenticate_header
+                or (challenge_context and keys_lower & challenge_keys)
+            )
+            if not has_actionable_surface:
+                return False, "x402 JSON lacked actionable payment surface", {"top_level_keys": sorted(keys)[:12]}
             payment_hints = collect_payment_hints(payload)
             merged_provider_hints = merge_unique_limited(
                 payment_hints.get("payment_provider_hints", []) if isinstance(payment_hints.get("payment_provider_hints"), list) else [],
@@ -463,19 +550,46 @@ def validate_x402(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
             return True, "x402-like JSON detected", facts
 
         if isinstance(payload, list) and payload:
-            return True, "x402-like JSON list detected", {"item_count": len(payload)}
+            matching_item_count = 0
+            for item in payload[:20]:
+                if not isinstance(item, dict):
+                    continue
+                item_keys_lower = {str(key).strip().lower() for key in item.keys()}
+                if (
+                    "x402" in item_keys_lower
+                    or "x402version" in item_keys_lower
+                    or "x402_version" in item_keys_lower
+                    or item_keys_lower & {"accepts", "resource", "resources", "services", "endpoints", "extensions", "payment", "payment_required"}
+                ):
+                    matching_item_count += 1
+            if matching_item_count == 0:
+                return False, "x402 list lacked structured payment objects", {"item_count": len(payload)}
+            return True, "x402-like JSON list detected", {
+                "item_count": len(payload),
+                "matching_item_count": matching_item_count,
+            }
 
         return False, "x402 payload was empty or unsupported", {}
 
-    if is_html_content_type(fetch.content_type) or looks_like_html_fragment(text):
+    if is_html_content_type(fetch.content_type) or looks_like_markup_fragment(text):
         return False, "x402 document looked like HTML fallback", {}
-    if "x402" in lower_text or "payment required" in lower_text:
-        return True, "x402-like text detected", {
+    if payment_required_header or www_authenticate_header:
+        facts = {
             "char_count": len(text),
             "payment_required_header_present": bool(payment_required_header),
             "www_authenticate_present": bool(www_authenticate_header),
         }
-    return False, "x402 text lacked x402/payment language", {"char_count": len(text)}
+        for key, value in payment_required_hints.items():
+            if isinstance(value, list) and value:
+                facts[key] = value
+            elif key == "payment_surface" and value:
+                facts[key] = value
+            elif key == "crypto_only" and value:
+                facts[key] = value
+        if isinstance(payment_required_payload, dict):
+            facts["payment_required_header_keys"] = sorted(str(key) for key in payment_required_payload.keys())[:12]
+        return True, "x402 payment challenge detected from headers", facts
+    return False, "x402 text lacked structured machine-readable evidence", {"char_count": len(text)}
 
 
 def validate_payment_probe(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:

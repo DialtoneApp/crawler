@@ -27,7 +27,7 @@ PAYMENT_PROVIDER_MARKERS = {
 }
 
 PAYMENT_RAIL_MARKERS = {
-    "card": ("card", "visa", "mastercard", "master", "american_express", "amex", "discover", "diners_club"),
+    "card": ("card", "visa", "mastercard", "master card", "american_express", "amex", "discover", "diners_club"),
     "digital_wallet": ("com.google.pay", "gpay", "google pay", "pay.google.com", "apple pay"),
     "crypto": ("usdc", "usdt", "bitcoin", "ethereum", "solana", "coinbase", "walletconnect", "nevermined", "asterpay"),
     "saved_card": ("saved card", "saved-card", "stripe-subscription", "card_network_machine_payments"),

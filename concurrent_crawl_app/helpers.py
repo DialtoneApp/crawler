@@ -324,8 +324,49 @@ def looks_like_html_fragment(text: str) -> bool:
         "<tr",
         "<td",
         "<form",
+        "<div",
+        "<span",
+        "<p",
+        "<a ",
+        "<h1",
+        "<h2",
+        "<h3",
+        "<h4",
+        "<h5",
+        "<h6",
     )
     return any(marker in lower_text for marker in markers)
+
+
+def looks_like_markup_fragment(text: str) -> bool:
+    if not isinstance(text, str):
+        return False
+    stripped = text.lstrip()
+    if not stripped.startswith("<"):
+        return False
+    lower_text = stripped.lower()
+    if looks_like_html_fragment(stripped):
+        return True
+    if stripped.startswith("<?xml"):
+        return True
+    if any(
+        lower_text.startswith(marker)
+        for marker in (
+            "<error",
+            "<response",
+            "<message",
+            "<status",
+            "<statuscode",
+            "<code",
+            "<resource",
+            "<urlset",
+            "<sitemapindex",
+            "<rss",
+            "<feed",
+        )
+    ):
+        return True
+    return bool(re.match(r"<[a-zA-Z][\w:-]*(?:\s|>|/)", stripped))
 
 
 def is_generic_error_fallback_body(text: str) -> bool:
@@ -420,28 +461,58 @@ def merge_unique_limited(existing: list[str], values: list[str], *, limit: int) 
     return merged
 
 
+def is_url_like_string(value: str) -> bool:
+    return isinstance(value, str) and value.startswith(("http://", "https://"))
+
+
+def marker_matches_text(text: str, marker: str) -> bool:
+    lowered_text = text.lower()
+    lowered_marker = marker.lower().strip()
+    if not lowered_marker:
+        return False
+    if any(character in lowered_marker for character in (".", "/", ":", "_", "-", " ")):
+        return lowered_marker in lowered_text
+    return bool(re.search(rf"(?<![a-z0-9]){re.escape(lowered_marker)}(?![a-z0-9])", lowered_text))
+
+
 def collect_payment_hints(value: Any) -> dict[str, Any]:
     strings = [item.strip() for item in flatten_strings(value) if isinstance(item, str)]
-    lower_strings = [item.lower() for item in strings if item]
+    text_strings = [item for item in strings if item and not is_url_like_string(item)]
+    lower_text_strings = [item.lower() for item in text_strings]
+    url_hosts: list[str] = []
 
     provider_hints: list[str] = []
     rail_hints: list[str] = []
     endpoint_hosts: list[str] = []
 
-    for provider, markers in PAYMENT_PROVIDER_MARKERS.items():
-        if any(any(marker in item for marker in markers) for item in lower_strings):
-            provider_hints.append(provider)
-
-    for rail, markers in PAYMENT_RAIL_MARKERS.items():
-        if any(any(marker in item for marker in markers) for item in lower_strings):
-            rail_hints.append(rail)
-
     for item in strings:
-        if not (item.startswith("http://") or item.startswith("https://")):
+        if not is_url_like_string(item):
             continue
         host = final_host(item)
         if host:
             endpoint_hosts.append(host)
+            url_hosts.append(host)
+
+    for provider, markers in PAYMENT_PROVIDER_MARKERS.items():
+        text_match = any(
+            marker_matches_text(item, marker)
+            for item in lower_text_strings
+            for marker in markers
+        )
+        host_match = any(
+            "." in marker and any(marker in host for host in url_hosts)
+            for marker in markers
+        )
+        if text_match or host_match:
+            provider_hints.append(provider)
+
+    for rail, markers in PAYMENT_RAIL_MARKERS.items():
+        if any(
+            marker_matches_text(item, marker)
+            for item in lower_text_strings
+            for marker in markers
+        ):
+            rail_hints.append(rail)
 
     payment_surface = None
     if "x402" in rail_hints:
@@ -458,7 +529,7 @@ def collect_payment_hints(value: Any) -> dict[str, Any]:
     has_non_crypto_rail = bool({"card", "digital_wallet", "saved_card"} & set(rail_hints))
     has_crypto_markers = any(
         any(marker in item for marker in ("usdc", "usdt", "solana", "base", "ethereum", "wallet", "coinbase", "eip155"))
-        for item in lower_strings
+        for item in lower_text_strings
     )
     crypto_only = bool(
         ("crypto" in rail_hints or ("x402" in rail_hints and has_crypto_markers))
