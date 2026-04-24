@@ -47,6 +47,9 @@
 - Improved catalog samples by deduplicating repeated products and attaching likely Shopify product URLs plus cart-derived currency when available.
 - Reworked `/.well-known/commerce` parsing so API-first offers can count as real machine-buyable surfaces without a `products.json` catalog. The crawler now extracts priced sample offers, purchase-intent URLs, live machine-payment path statuses, and provider hints from the commerce document itself.
 - Stopped treating generic OpenAPI `402 Payment Required` responses as `x402`. OpenAPI now records payment-challenge operations and `payment-signature` header support separately, so `x402` is only inferred from explicit x402-specific evidence.
+- Extended commerce parsing to support alternate vendor schemas such as `offerings`, `priceCurrency`, `unit`, `checkout_url`, `paymentHandlers`, and `billing_provider`, so non-Shopify SaaS pricing manifests can still produce offer receipts.
+- Tightened x402 validation so probe/example manifests that explicitly say they do not accept per-call x402 payments no longer count as live machine-payment surfaces.
+- Added prelaunch/preorder detection from commerce status and billing-provider state, so priced offers that are documented but not yet live do not get upgraded to `machine_payable`.
 
 ### Output model now
 
