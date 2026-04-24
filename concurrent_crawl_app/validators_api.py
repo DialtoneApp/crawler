@@ -5,6 +5,7 @@ from typing import Any
 
 from .helpers import (
     collect_payment_hints,
+    decode_json_like_header,
     decode_body,
     extract_template_parameters,
     is_json_content_type,
@@ -194,13 +195,25 @@ def validate_x402(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
     text = decode_body(fetch.body).strip()
     payment_required_header = fetch.headers.get("payment-required") or fetch.headers.get("x-payment-required")
     www_authenticate_header = fetch.headers.get("www-authenticate")
+    payment_required_payload = decode_json_like_header(payment_required_header)
+    payment_required_hints = collect_payment_hints(payment_required_payload) if payment_required_payload is not None else {}
     if not text:
         if payment_required_header or www_authenticate_header:
-            return True, "x402 payment challenge detected from headers", {
+            facts = {
                 "header_challenge_present": True,
                 "payment_required_header_present": bool(payment_required_header),
                 "www_authenticate_present": bool(www_authenticate_header),
             }
+            for key, value in payment_required_hints.items():
+                if isinstance(value, list) and value:
+                    facts[key] = value
+                elif key == "payment_surface" and value:
+                    facts[key] = value
+                elif key == "crypto_only" and value:
+                    facts[key] = value
+            if isinstance(payment_required_payload, dict):
+                facts["payment_required_header_keys"] = sorted(str(key) for key in payment_required_payload.keys())[:12]
+            return True, "x402 payment challenge detected from headers", facts
         return False, "x402 document was empty", {}
 
     lower_text = text.lower()
@@ -364,7 +377,24 @@ def validate_x402(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
                 if isinstance(name, str) and name.strip():
                     accept_currencies = merge_unique_limited(accept_currencies, [name.strip().upper()[:16]], limit=12)
             payment_hints = collect_payment_hints(payload)
-            return True, "x402-like JSON detected", {
+            merged_provider_hints = merge_unique_limited(
+                payment_hints.get("payment_provider_hints", []) if isinstance(payment_hints.get("payment_provider_hints"), list) else [],
+                payment_required_hints.get("payment_provider_hints", []) if isinstance(payment_required_hints.get("payment_provider_hints"), list) else [],
+                limit=12,
+            )
+            merged_rail_hints = merge_unique_limited(
+                payment_hints.get("payment_rail_hints", []) if isinstance(payment_hints.get("payment_rail_hints"), list) else [],
+                payment_required_hints.get("payment_rail_hints", []) if isinstance(payment_required_hints.get("payment_rail_hints"), list) else [],
+                limit=12,
+            )
+            merged_endpoint_hosts = merge_unique_limited(
+                payment_hints.get("payment_endpoint_hosts", []) if isinstance(payment_hints.get("payment_endpoint_hosts"), list) else [],
+                payment_required_hints.get("payment_endpoint_hosts", []) if isinstance(payment_required_hints.get("payment_endpoint_hosts"), list) else [],
+                limit=12,
+            )
+            merged_payment_surface = payment_hints.get("payment_surface") or payment_required_hints.get("payment_surface")
+            merged_crypto_only = bool(payment_hints.get("crypto_only")) or bool(payment_required_hints.get("crypto_only"))
+            facts = {
                 "top_level_keys": sorted(keys)[:12],
                 "resource_urls": resource_urls,
                 "resource_url_count": len(resource_urls),
@@ -378,8 +408,15 @@ def validate_x402(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
                 "payment_probe_candidates": probe_candidates,
                 "payment_required_header_present": bool(payment_required_header),
                 "www_authenticate_present": bool(www_authenticate_header),
-                **payment_hints,
+                "payment_provider_hints": merged_provider_hints,
+                "payment_rail_hints": merged_rail_hints,
+                "payment_endpoint_hosts": merged_endpoint_hosts,
+                "payment_surface": merged_payment_surface,
+                "crypto_only": merged_crypto_only,
             }
+            if isinstance(payment_required_payload, dict):
+                facts["payment_required_header_keys"] = sorted(str(key) for key in payment_required_payload.keys())[:12]
+            return True, "x402-like JSON detected", facts
 
         if isinstance(payload, list) and payload:
             return True, "x402-like JSON list detected", {"item_count": len(payload)}
@@ -402,19 +439,50 @@ def validate_payment_probe(fetch: FetchResponse) -> tuple[bool, str, dict[str, A
     www_authenticate_header = fetch.headers.get("www-authenticate")
     text = decode_body(fetch.body).strip() if fetch.body else ""
     header_payment_hints = collect_payment_hints(www_authenticate_header) if isinstance(www_authenticate_header, str) and www_authenticate_header.strip() else {}
+    payment_required_payload = decode_json_like_header(payment_required_header)
+    payment_required_hints = collect_payment_hints(payment_required_payload) if payment_required_payload is not None else {}
     facts: dict[str, Any] = {
         "probe_method": fetch.request_method,
         "probe_url": fetch.requested_url,
         "payment_required_header_present": bool(payment_required_header),
         "www_authenticate_present": bool(www_authenticate_header),
     }
+    merged_header_provider_hints = merge_unique_limited(
+        header_payment_hints.get("payment_provider_hints", []) if isinstance(header_payment_hints.get("payment_provider_hints"), list) else [],
+        payment_required_hints.get("payment_provider_hints", []) if isinstance(payment_required_hints.get("payment_provider_hints"), list) else [],
+        limit=12,
+    )
+    merged_header_rail_hints = merge_unique_limited(
+        header_payment_hints.get("payment_rail_hints", []) if isinstance(header_payment_hints.get("payment_rail_hints"), list) else [],
+        payment_required_hints.get("payment_rail_hints", []) if isinstance(payment_required_hints.get("payment_rail_hints"), list) else [],
+        limit=12,
+    )
+    merged_header_endpoint_hosts = merge_unique_limited(
+        header_payment_hints.get("payment_endpoint_hosts", []) if isinstance(header_payment_hints.get("payment_endpoint_hosts"), list) else [],
+        payment_required_hints.get("payment_endpoint_hosts", []) if isinstance(payment_required_hints.get("payment_endpoint_hosts"), list) else [],
+        limit=12,
+    )
+    merged_header_surface = header_payment_hints.get("payment_surface") or payment_required_hints.get("payment_surface")
+    merged_header_crypto_only = bool(header_payment_hints.get("crypto_only")) or bool(payment_required_hints.get("crypto_only"))
+    if merged_header_provider_hints:
+        facts["payment_provider_hints"] = merged_header_provider_hints
+    if merged_header_rail_hints:
+        facts["payment_rail_hints"] = merged_header_rail_hints
+    if merged_header_endpoint_hosts:
+        facts["payment_endpoint_hosts"] = merged_header_endpoint_hosts
+    if merged_header_surface:
+        facts["payment_surface"] = merged_header_surface
+    if merged_header_crypto_only:
+        facts["crypto_only"] = merged_header_crypto_only
+    if isinstance(payment_required_payload, dict):
+        facts["payment_required_header_keys"] = sorted(str(key) for key in payment_required_payload.keys())[:12]
     for key, value in header_payment_hints.items():
         if isinstance(value, list) and value:
-            facts[key] = value
+            facts.setdefault(key, value)
         elif key == "payment_surface" and value:
-            facts[key] = value
+            facts.setdefault(key, value)
         elif key == "crypto_only" and value:
-            facts[key] = value
+            facts.setdefault(key, value)
 
     if fetch.status == 402:
         facts["probe_result"] = "payment_challenge"

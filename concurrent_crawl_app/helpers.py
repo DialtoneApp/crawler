@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import html
+import json
 import re
 from typing import Any
 from urllib.parse import urljoin, urlsplit
@@ -112,6 +114,36 @@ def derive_well_known_url(base_url: str | None, well_known_path: str) -> str | N
 
 def derive_x402_discovery_url(base_url: str | None) -> str | None:
     return derive_well_known_url(base_url, "/.well-known/x402.json")
+
+
+def decode_json_like_header(value: str | None) -> Any | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if text[:1] in "[{":
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return None
+
+    compact = text.replace("\n", "").replace(" ", "")
+    if not compact:
+        return None
+    padding = "=" * (-len(compact) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(f"{compact}{padding}".encode("ascii"))
+    except (ValueError, UnicodeEncodeError):
+        return None
+
+    decoded_text = decoded.decode("utf-8", errors="replace").strip()
+    if not decoded_text or decoded_text[:1] not in "[{":
+        return None
+    try:
+        return json.loads(decoded_text)
+    except json.JSONDecodeError:
+        return None
 
 
 def parse_html_attributes(tag_text: str) -> dict[str, str]:

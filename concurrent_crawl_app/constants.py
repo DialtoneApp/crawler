@@ -11,10 +11,12 @@ TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 
 PAYMENT_PROVIDER_MARKERS = {
     "asterpay": ("asterpay", "asterpay.io"),
+    "circle": ("circle", "circle.com", "circle gateway"),
+    "coinbase": ("coinbase", "coinbase.com"),
     "crossmint": ("crossmint",),
     "dialtoneapp_network": ("dialtoneapp_network", "dialtoneapp network", "dtapp_network_v1"),
     "google_pay": ("com.google.pay", "gpay", "google pay", "pay.google.com"),
-    "nevermined": ("nevermined",),
+    "nevermined": ("nevermined", "nevermined.ai"),
     "paypal": ("paypal",),
     "polar": ("polar",),
     "shopify": ("shopify", "myshopify.com"),
