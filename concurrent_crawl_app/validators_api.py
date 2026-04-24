@@ -25,6 +25,24 @@ from .validators_support import (
 )
 
 
+def summarize_x402_resource_title(payload: dict[str, Any], resource: dict[str, Any] | None, fallback_url: str | None) -> str | None:
+    payload_name = payload.get("name")
+    if isinstance(payload_name, str) and payload_name.strip():
+        return payload_name.strip()[:120]
+    if isinstance(resource, dict):
+        resource_name = resource.get("name")
+        if isinstance(resource_name, str) and resource_name.strip():
+            return resource_name.strip()[:120]
+        description = resource.get("description")
+        if isinstance(description, str) and description.strip():
+            first_sentence = description.strip().split(". ", 1)[0].strip()
+            if first_sentence:
+                return first_sentence[:120]
+    if isinstance(fallback_url, str) and fallback_url.strip():
+        return fallback_url.strip().rsplit("/", 1)[-1][:120]
+    return None
+
+
 def validate_openapi(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
     if fetch.truncated:
         return False, f"OpenAPI response truncated at {fetch.byte_count} bytes", {"truncated": True}
@@ -227,6 +245,7 @@ def validate_x402(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
                 endpoints=payload.get("endpoints") if isinstance(payload.get("endpoints"), dict) else {},
                 source="x402",
             )
+            primary_resource: dict[str, Any] | None = resources[0] if resources and isinstance(resources[0], dict) else None
             for resource in resources:
                 if isinstance(resource, str) and resource.strip():
                     resource_urls = merge_unique_limited(resource_urls, [resource.strip()], limit=12)
@@ -259,18 +278,75 @@ def validate_x402(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
                             resource_urls = merge_unique_limited(resource_urls, [candidate_url], limit=12)
                             break
                     if candidate_url:
+                        resource_title = summarize_x402_resource_title(payload, resource, candidate_url)
+                        resource_description = resource.get("description") if isinstance(resource.get("description"), str) else None
                         sample_actions = merge_action_samples(
                             sample_actions,
                             [
                                 build_action_sample(
                                     method=resource.get("method") if isinstance(resource.get("method"), str) else "POST",
                                     url=candidate_url,
-                                    title=resource.get("description") if isinstance(resource.get("description"), str) else candidate_url.rsplit("/", 1)[-1],
-                                    description=resource.get("description") if isinstance(resource.get("description"), str) else None,
+                                    title=resource_title,
+                                    description=resource_description,
                                     source="x402",
                                 )
                             ],
                         )
+            extensions = payload.get("extensions") if isinstance(payload.get("extensions"), dict) else {}
+            bazaar = extensions.get("bazaar") if isinstance(extensions.get("bazaar"), dict) else {}
+            bazaar_info = bazaar.get("info") if isinstance(bazaar.get("info"), dict) else {}
+            bazaar_input = bazaar_info.get("input") if isinstance(bazaar_info.get("input"), dict) else {}
+            if bazaar_input:
+                candidate_url = None
+                for candidate_key in ("url", "resource", "endpoint", "path"):
+                    raw_value = bazaar_input.get(candidate_key)
+                    if isinstance(raw_value, str) and raw_value.strip():
+                        candidate_url = resolve_url(base_reference, raw_value)
+                        if candidate_url:
+                            break
+                if candidate_url is None and isinstance(primary_resource, dict):
+                    resource_url = primary_resource.get("url") or primary_resource.get("resource") or primary_resource.get("endpoint")
+                    if isinstance(resource_url, str) and resource_url.strip():
+                        candidate_url = resolve_url(base_reference, resource_url)
+                if candidate_url is None:
+                    candidate_url = fetch.final_url or fetch.requested_url
+
+                candidate_method = bazaar_input.get("method") if isinstance(bazaar_input.get("method"), str) else "GET"
+                candidate_body = bazaar_input.get("body")
+                if candidate_body is None:
+                    candidate_body = heuristic_sample_body(candidate_url, candidate_method)
+                body_type = bazaar_input.get("bodyType") if isinstance(bazaar_input.get("bodyType"), str) else None
+                content_type = "application/json" if body_type in {None, "json"} else None
+                if body_type == "text":
+                    content_type = "text/plain"
+                title = summarize_x402_resource_title(payload, primary_resource, candidate_url)
+                description = None
+                if isinstance(primary_resource, dict) and isinstance(primary_resource.get("description"), str):
+                    description = primary_resource.get("description")
+                if candidate_url:
+                    resource_urls = merge_unique_limited(resource_urls, [candidate_url], limit=12)
+                sample_actions = merge_action_samples(
+                    sample_actions,
+                    [
+                        build_action_sample(
+                            method=candidate_method,
+                            url=candidate_url,
+                            title=title,
+                            description=description,
+                            source="x402",
+                        )
+                    ],
+                )
+                candidate = build_probe_candidate(
+                    url=candidate_url,
+                    method=candidate_method,
+                    body=candidate_body,
+                    content_type=content_type,
+                    source="x402",
+                    title=title,
+                )
+                if candidate:
+                    probe_candidates = merge_probe_candidates(probe_candidates, [candidate])
             accept_networks: list[str] = []
             accept_assets: list[str] = []
             accept_currencies: list[str] = []
