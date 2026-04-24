@@ -90,6 +90,7 @@
 - Extended template handling to understand colon-style path params like `:domain` and added safe default substitutions for simple cases. This lets priced agent-extension maps such as `scoutscore.ai`'s `/api/bazaar/score/:domain` produce a live `402` verification probe.
 - Added priced endpoint extraction from `agent.json` capability extensions, especially `capabilities.extensions[].params.pricing.endpoints`, so x402/payment metadata embedded in agent extensions produces `sample_actions` and `payment_probe_candidates`.
 - Reworked the payment-probe step to keep trying candidates until it finds a real `402` challenge or a real unpaid success, instead of stopping at the first auth-gated or low-signal candidate. This fixed cases like `agoragentic.com`, where the first candidate hit an authenticated staking route but a later x402 invoke route returned the real challenge.
+- Added a slower retry path for domains that finish the fast pass as `rate_limited`. The crawler now waits, increases the request timeout, relaxes the early 429 bailout threshold, and reruns the same domain once under the same wall-clock budget. If the slower pass recovers a stronger surface, that receipt wins; otherwise the domain keeps its explicit `rate_limited` label with retry metadata.
 
 ### Output model now
 

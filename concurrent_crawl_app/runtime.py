@@ -37,13 +37,23 @@ def submit_next(
     timeout: float,
     run_token: str,
     wall_clock_limit: float,
+    rate_limit_retry_passes: int,
+    rate_limit_retry_delay: float,
 ) -> bool:
     try:
         domain_input = next(domains)
     except StopIteration:
         return False
 
-    future = executor.submit(probe_domain, domain_input, timeout, run_token, wall_clock_limit)
+    future = executor.submit(
+        probe_domain,
+        domain_input,
+        timeout,
+        run_token,
+        wall_clock_limit,
+        rate_limit_retry_passes,
+        rate_limit_retry_delay,
+    )
     futures[future] = InFlightTask(domain_input=domain_input, submitted_at=time.monotonic())
     return True
 
@@ -252,6 +262,12 @@ def crawl(args) -> int:
     if args.domain_wall_clock_limit < 0:
         print("--domain-wall-clock-limit must be 0 or greater", file=sys.stderr)
         return 2
+    if args.rate_limit_retry_passes < 0:
+        print("--rate-limit-retry-passes must be 0 or greater", file=sys.stderr)
+        return 2
+    if args.rate_limit_retry_delay < 0:
+        print("--rate-limit-retry-delay must be 0 or greater", file=sys.stderr)
+        return 2
     if not csv_path.exists():
         print(f"CSV file not found: {csv_path}", file=sys.stderr)
         return 2
@@ -313,6 +329,8 @@ def crawl(args) -> int:
                     args.timeout,
                     run_token,
                     args.domain_wall_clock_limit,
+                    args.rate_limit_retry_passes,
+                    args.rate_limit_retry_delay,
                 ):
                     break
 
@@ -409,6 +427,8 @@ def crawl(args) -> int:
                         args.timeout,
                         run_token,
                         args.domain_wall_clock_limit,
+                        args.rate_limit_retry_passes,
+                        args.rate_limit_retry_delay,
                     )
     except KeyboardInterrupt:
         interrupted = True

@@ -62,6 +62,18 @@ def parse_args() -> argparse.Namespace:
         help="Best-effort per-domain wall-clock limit in seconds. Use 0 to disable.",
     )
     parser.add_argument(
+        "--rate-limit-retry-passes",
+        type=int,
+        default=1,
+        help="How many slower retry passes to run when a domain finishes as rate_limited. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--rate-limit-retry-delay",
+        type=float,
+        default=4.0,
+        help="Base delay in seconds before each slower retry pass for a rate_limited domain.",
+    )
+    parser.add_argument(
         "--receipt-shard-max-bytes",
         type=int,
         default=128 * 1024 * 1024,

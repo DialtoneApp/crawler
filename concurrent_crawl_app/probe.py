@@ -18,6 +18,21 @@ STORED_ARTIFACT_KEYS = frozenset({"robots_txt", "llms_txt", "llms_full_txt"})
 RETRYABLE_FETCH_ERRORS = frozenset({"timeout", "url_error:timed out"})
 LIGHTWEIGHT_BASE_PROBE_KEYS = frozenset({"robots_txt", "sitemap_xml", "llms_txt", "llms_full_txt"})
 RATE_LIMIT_SKIP_THRESHOLD = 3
+SLOW_RATE_LIMIT_SKIP_THRESHOLD = 5
+SLOW_RATE_LIMIT_TIMEOUT_MULTIPLIER = 1.5
+SLOW_RATE_LIMIT_TIMEOUT_INCREMENT = 2.0
+MIN_RATE_LIMIT_RETRY_BUDGET_SECONDS = 6.0
+LABEL_PRIORITY = {
+    "unreachable": 0,
+    "no_clear_signal": 1,
+    "crawl_basics_only": 2,
+    "rate_limited": 3,
+    "ai_readable": 4,
+    "catalog_surface": 5,
+    "callable_surface": 6,
+    "offer_surface": 7,
+    "machine_payable": 8,
+}
 
 
 def finalize_receipt(
@@ -150,6 +165,71 @@ def maybe_backoff_after_rate_limit(domain: str, outcomes: dict[str, ProbeOutcome
     if hit_count <= 0:
         return
     time.sleep(rate_limit_backoff_seconds(domain, hit_count))
+
+
+def rate_limit_retry_timeout(base_timeout: float) -> float:
+    return max(
+        base_timeout,
+        (base_timeout * SLOW_RATE_LIMIT_TIMEOUT_MULTIPLIER) + SLOW_RATE_LIMIT_TIMEOUT_INCREMENT,
+    )
+
+
+def remaining_wall_clock_budget(started_at: float, wall_clock_limit: float | None) -> float | None:
+    if not wall_clock_limit or wall_clock_limit <= 0:
+        return None
+    return max(wall_clock_limit - (time.monotonic() - started_at), 0.0)
+
+
+def count_valid_outcomes(receipt: Any) -> int:
+    probes = receipt.probes if hasattr(receipt, "probes") else {}
+    return sum(1 for outcome in probes.values() if outcome.status == "valid")
+
+
+def count_receipt_rate_limited_outcomes(receipt: Any) -> int:
+    probes = receipt.probes if hasattr(receipt, "probes") else {}
+    return sum(1 for outcome in probes.values() if outcome.status == "rate_limited")
+
+
+def receipt_selection_key(receipt: Any) -> tuple[int, int, int, int]:
+    label_priority = LABEL_PRIORITY.get(getattr(receipt, "label", ""), -1)
+    verified_payment_surface = int(bool(getattr(receipt, "aggregates", {}).get("verified_payment_surface")))
+    valid_outcome_count = count_valid_outcomes(receipt)
+    rate_limited_outcome_penalty = -count_receipt_rate_limited_outcomes(receipt)
+    return (
+        label_priority,
+        verified_payment_surface,
+        valid_outcome_count,
+        rate_limited_outcome_penalty,
+    )
+
+
+def best_receipt(primary: Any, secondary: Any) -> Any:
+    if receipt_selection_key(secondary) > receipt_selection_key(primary):
+        return secondary
+    return primary
+
+
+def annotate_rate_limit_retry(
+    receipt: Any,
+    *,
+    attempted: bool,
+    attempt_count: int,
+    initial_label: str,
+    final_label: str,
+    delay_seconds: float,
+    initial_rate_limited_probe_count: int,
+    final_rate_limited_probe_count: int,
+) -> Any:
+    aggregates = dict(receipt.aggregates)
+    aggregates["rate_limit_retry_attempted"] = attempted
+    aggregates["rate_limit_retry_attempt_count"] = attempt_count
+    aggregates["rate_limit_retry_initial_label"] = initial_label
+    aggregates["rate_limit_retry_final_label"] = final_label
+    aggregates["rate_limit_retry_recovered"] = initial_label == "rate_limited" and final_label != "rate_limited"
+    aggregates["rate_limit_retry_delay_seconds"] = round(max(delay_seconds, 0.0), 3)
+    aggregates["rate_limit_retry_initial_rate_limited_probe_count"] = initial_rate_limited_probe_count
+    aggregates["rate_limit_retry_final_rate_limited_probe_count"] = final_rate_limited_probe_count
+    return replace(receipt, aggregates=aggregates)
 
 
 def mark_probe_specs_skipped(
@@ -575,17 +655,19 @@ def iter_remote_x402_candidate_urls(
         yield candidate_url
 
 
-def probe_domain(
+def probe_domain_once(
     domain_input: DomainInput,
     timeout: float,
     run_token: str,
+    started_at: float,
     wall_clock_limit: float | None = None,
+    *,
+    rate_limit_skip_threshold: int = RATE_LIMIT_SKIP_THRESHOLD,
 ):
     domain = domain_input.domain
     outcomes: dict[str, ProbeOutcome] = {}
     control_cache: dict[str, FetchResponse] = {}
     artifacts: dict[str, bytes] = {}
-    started_at = time.monotonic()
 
     homepage_spec = next(spec for spec in BASE_PROBES if spec.key == "homepage")
     lightweight_specs = [spec for spec in BASE_PROBES if spec.key in LIGHTWEIGHT_BASE_PROBE_KEYS]
@@ -626,7 +708,7 @@ def probe_domain(
             return timeout_receipt
         probe_base_spec(spec)
         if (
-            count_rate_limited_outcomes(outcomes) >= RATE_LIMIT_SKIP_THRESHOLD
+            count_rate_limited_outcomes(outcomes) >= rate_limit_skip_threshold
             and count_valid_surface_outcomes(outcomes) == 0
         ):
             mark_probe_specs_skipped(
@@ -676,7 +758,7 @@ def probe_domain(
         not any(spec.key in outcomes for spec in discovery_specs)
         and (
             homepage_outcome.status == "rate_limited"
-            or count_rate_limited_outcomes(outcomes) >= RATE_LIMIT_SKIP_THRESHOLD
+            or count_rate_limited_outcomes(outcomes) >= rate_limit_skip_threshold
         )
         and count_valid_surface_outcomes(outcomes) == 0
     ):
@@ -707,7 +789,7 @@ def probe_domain(
             return timeout_receipt
         probe_base_spec(spec)
         if (
-            count_rate_limited_outcomes(outcomes) >= RATE_LIMIT_SKIP_THRESHOLD
+            count_rate_limited_outcomes(outcomes) >= rate_limit_skip_threshold
             and count_valid_surface_outcomes(outcomes) == 0
         ):
             mark_probe_specs_skipped(
@@ -1059,4 +1141,75 @@ def probe_domain(
         artifacts,
         started_at=started_at,
         wall_clock_limit=wall_clock_limit,
+    )
+
+
+def probe_domain(
+    domain_input: DomainInput,
+    timeout: float,
+    run_token: str,
+    wall_clock_limit: float | None = None,
+    rate_limit_retry_passes: int = 1,
+    rate_limit_retry_delay: float = 4.0,
+):
+    overall_started_at = time.monotonic()
+    initial_receipt = probe_domain_once(
+        domain_input,
+        timeout,
+        run_token,
+        overall_started_at,
+        wall_clock_limit=wall_clock_limit,
+        rate_limit_skip_threshold=RATE_LIMIT_SKIP_THRESHOLD,
+    )
+
+    if (
+        initial_receipt.label != "rate_limited"
+        or rate_limit_retry_passes <= 0
+        or bool(initial_receipt.aggregates.get("domain_wall_clock_timeout"))
+    ):
+        return initial_receipt
+
+    chosen_receipt = initial_receipt
+    latest_receipt = initial_receipt
+    attempted_retry = False
+    total_retry_delay_seconds = 0.0
+    attempt_count = 1
+
+    for _ in range(rate_limit_retry_passes):
+        if latest_receipt.label != "rate_limited" or bool(latest_receipt.aggregates.get("domain_wall_clock_timeout")):
+            break
+        remaining_budget = remaining_wall_clock_budget(overall_started_at, wall_clock_limit)
+        retry_delay_seconds = max(rate_limit_retry_delay, 0.0)
+        if isinstance(latest_receipt.aggregates.get("rate_limited_retry_after_seconds"), int):
+            retry_delay_seconds = max(
+                retry_delay_seconds,
+                min(int(latest_receipt.aggregates["rate_limited_retry_after_seconds"]), 8),
+            )
+        if remaining_budget is not None and remaining_budget < (retry_delay_seconds + MIN_RATE_LIMIT_RETRY_BUDGET_SECONDS):
+            break
+        attempted_retry = True
+        total_retry_delay_seconds += retry_delay_seconds
+        time.sleep(retry_delay_seconds)
+        latest_receipt = probe_domain_once(
+            domain_input,
+            rate_limit_retry_timeout(timeout),
+            run_token,
+            overall_started_at,
+            wall_clock_limit=wall_clock_limit,
+            rate_limit_skip_threshold=SLOW_RATE_LIMIT_SKIP_THRESHOLD,
+        )
+        attempt_count += 1
+        chosen_receipt = best_receipt(chosen_receipt, latest_receipt)
+        if chosen_receipt.label != "rate_limited":
+            break
+
+    return annotate_rate_limit_retry(
+        chosen_receipt,
+        attempted=attempted_retry,
+        attempt_count=attempt_count,
+        initial_label=initial_receipt.label,
+        final_label=chosen_receipt.label,
+        delay_seconds=total_retry_delay_seconds,
+        initial_rate_limited_probe_count=count_receipt_rate_limited_outcomes(initial_receipt),
+        final_rate_limited_probe_count=count_receipt_rate_limited_outcomes(chosen_receipt),
     )
