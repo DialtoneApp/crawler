@@ -9,9 +9,11 @@ from .helpers import (
     decode_body,
     extract_template_parameters,
     extract_title,
+    is_generic_error_fallback_body,
     is_html_content_type,
     is_json_content_type,
     is_login_handoff_body,
+    looks_like_html_fragment,
     merge_unique_limited,
     resolve_openapi_path,
     resolve_url,
@@ -255,6 +257,8 @@ def validate_x402(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
     lower_text = text.lower()
     if is_login_handoff_body(text):
         return False, "x402 document looked like a login handoff page", {}
+    if is_generic_error_fallback_body(text):
+        return False, "x402 document looked like an error or block page", {}
     if is_json_content_type(fetch.content_type) or text[:1] in "[{":
         try:
             payload = parse_json_body(fetch)
@@ -463,7 +467,7 @@ def validate_x402(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
 
         return False, "x402 payload was empty or unsupported", {}
 
-    if "<html" in lower_text or "<body" in lower_text or "<script" in lower_text:
+    if is_html_content_type(fetch.content_type) or looks_like_html_fragment(text):
         return False, "x402 document looked like HTML fallback", {}
     if "x402" in lower_text or "payment required" in lower_text:
         return True, "x402-like text detected", {
@@ -545,6 +549,7 @@ def validate_payment_probe(fetch: FetchResponse) -> tuple[bool, str, dict[str, A
 
     looks_like_html_document = (
         is_html_content_type(fetch.content_type)
+        or looks_like_html_fragment(text)
         or "<!doctype html" in lower_text
         or "<html" in lower_text
         or "<head" in lower_text
@@ -560,7 +565,10 @@ def validate_payment_probe(fetch: FetchResponse) -> tuple[bool, str, dict[str, A
                 title = extract_title(text)
                 if title:
                     facts["response_title"] = title
-            return False, "Action request returned an HTML page instead of an API response", facts
+            detail = "Action request returned an HTML page instead of an API response"
+            if is_generic_error_fallback_body(text):
+                detail = "Action request returned an HTML error or block page"
+            return False, detail, facts
         facts["probe_result"] = "success_without_payment"
         if text:
             facts["response_char_count"] = len(text)

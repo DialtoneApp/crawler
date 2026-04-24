@@ -12,9 +12,11 @@ from .helpers import (
     extract_title,
     final_host,
     flatten_strings,
+    is_generic_error_fallback_body,
     has_placeholder_value,
     infer_payment_surface_from_hints,
     is_active_offer_status,
+    looks_like_html_fragment,
     is_human_checkout_kind,
     is_html_content_type,
     is_json_content_type,
@@ -94,10 +96,12 @@ def validate_llms(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
     if not text:
         return False, "llms document was empty", {}
     lower_text = text.lower()
-    if "<html" in lower_text or "<body" in lower_text or "<script" in lower_text:
-        return False, "llms document looked like HTML fallback", {}
     if is_login_handoff_body(text):
         return False, "llms document looked like a login handoff page", {}
+    if is_generic_error_fallback_body(text):
+        return False, "llms document looked like an error or block page", {}
+    if looks_like_html_fragment(text):
+        return False, "llms document looked like HTML fallback", {}
     discovered_urls = extract_absolute_urls(text)
     x402_urls: list[str] = []
     for url in discovered_urls:
@@ -130,6 +134,8 @@ def validate_commerce(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
         return False, "commerce document was empty", {}
     if is_login_handoff_body(text):
         return False, "commerce document looked like a login handoff page", {}
+    if is_generic_error_fallback_body(text):
+        return False, "commerce document looked like an error or block page", {}
 
     if is_json_content_type(fetch.content_type) or text[:1] in "[{":
         try:
@@ -330,7 +336,7 @@ def validate_commerce(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
         return True, "Structured commerce list detected", {"item_count": len(payload)}
 
     lower_text = text.lower()
-    if "<html" in lower_text or "<body" in lower_text or "<script" in lower_text:
+    if is_html_content_type(fetch.content_type) or looks_like_html_fragment(text):
         return False, "commerce document looked like HTML fallback", {}
     keywords = ("price", "offer", "checkout", "payment", "purchase", "commerce")
     if any(keyword in lower_text for keyword in keywords):

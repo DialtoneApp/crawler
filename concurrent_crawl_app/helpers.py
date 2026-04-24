@@ -304,6 +304,53 @@ def is_login_handoff_body(text: str) -> bool:
     return matches >= 2
 
 
+def looks_like_html_fragment(text: str) -> bool:
+    if not isinstance(text, str) or "<" not in text or ">" not in text:
+        return False
+    lower_text = text.lower()
+    markers = (
+        "<!doctype html",
+        "<html",
+        "<head",
+        "<body",
+        "<title",
+        "<meta ",
+        "<script",
+        "<iframe",
+        "<frame",
+        "<style",
+        "<center",
+        "<table",
+        "<tr",
+        "<td",
+        "<form",
+    )
+    return any(marker in lower_text for marker in markers)
+
+
+def is_generic_error_fallback_body(text: str) -> bool:
+    if not isinstance(text, str) or not text:
+        return False
+    lower_text = text.lower()
+    if any(
+        marker in lower_text
+        for marker in (
+            "web firewall security policies",
+            "security policies have been blocked",
+            "request / response that are contrary",
+            "detect url",
+            "common-error",
+            "wh_errcode=404",
+        )
+    ):
+        return True
+    if "page not found" in lower_text and looks_like_html_fragment(text):
+        return True
+    if "not found" in lower_text and "redirecturl=" in lower_text:
+        return True
+    return False
+
+
 def parse_price(value: Any) -> float | None:
     if value is None:
         return None
