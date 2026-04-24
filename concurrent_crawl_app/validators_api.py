@@ -3,7 +3,15 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from .helpers import collect_payment_hints, decode_body, is_json_content_type, is_login_handoff_body, merge_unique_limited, resolve_url
+from .helpers import (
+    collect_payment_hints,
+    decode_body,
+    extract_template_parameters,
+    is_json_content_type,
+    is_login_handoff_body,
+    merge_unique_limited,
+    resolve_url,
+)
 from .http_client import parse_json_body
 from .models import FetchResponse
 from .validators_support import (
@@ -59,6 +67,12 @@ def validate_openapi(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
         if isinstance(server, dict) and isinstance(server.get("url"), str) and server.get("url").strip():
             base_reference = server["url"].strip()
             break
+
+    readable_paths = {
+        str(path_name): path_item
+        for path_name, path_item in paths.items()
+        if isinstance(path_item, dict)
+    }
 
     for path_name, path_item in paths.items():
         if not isinstance(path_item, dict):
@@ -122,6 +136,24 @@ def validate_openapi(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
                     title=summary if isinstance(summary, str) else path_name,
                 )
                 if candidate:
+                    template_parameters = extract_template_parameters(path_name)
+                    if template_parameters:
+                        candidate["template_parameters"] = template_parameters
+                        collection_path = path_name.split("{", 1)[0].rstrip("/")
+                        collection_path_item = readable_paths.get(collection_path)
+                        if isinstance(collection_path_item, dict) and isinstance(collection_path_item.get("get"), dict):
+                            discovery_url = resolve_url(base_reference, collection_path)
+                            if discovery_url:
+                                candidate["discovery_url"] = discovery_url
+                        resource_path = path_name.rsplit("/", 1)[0] if "/" in path_name else path_name
+                        for lookup_suffix in ("/price", "/pricing", "/quote"):
+                            lookup_path = f"{resource_path}{lookup_suffix}"
+                            lookup_item = readable_paths.get(lookup_path)
+                            if isinstance(lookup_item, dict) and isinstance(lookup_item.get("get"), dict):
+                                price_lookup_url = resolve_url(base_reference, lookup_path)
+                                if price_lookup_url:
+                                    candidate["price_lookup_url"] = price_lookup_url
+                                break
                     probe_candidates = merge_probe_candidates(probe_candidates, [candidate])
 
     return True, "OpenAPI document detected", {
@@ -293,12 +325,20 @@ def validate_payment_probe(fetch: FetchResponse) -> tuple[bool, str, dict[str, A
     payment_required_header = fetch.headers.get("payment-required") or fetch.headers.get("x-payment-required")
     www_authenticate_header = fetch.headers.get("www-authenticate")
     text = decode_body(fetch.body).strip() if fetch.body else ""
+    header_payment_hints = collect_payment_hints(www_authenticate_header) if isinstance(www_authenticate_header, str) and www_authenticate_header.strip() else {}
     facts: dict[str, Any] = {
         "probe_method": fetch.request_method,
         "probe_url": fetch.requested_url,
         "payment_required_header_present": bool(payment_required_header),
         "www_authenticate_present": bool(www_authenticate_header),
     }
+    for key, value in header_payment_hints.items():
+        if isinstance(value, list) and value:
+            facts[key] = value
+        elif key == "payment_surface" and value:
+            facts[key] = value
+        elif key == "crypto_only" and value:
+            facts[key] = value
 
     if fetch.status == 402:
         facts["probe_result"] = "payment_challenge"

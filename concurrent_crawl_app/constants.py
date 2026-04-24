@@ -20,6 +20,7 @@ PAYMENT_PROVIDER_MARKERS = {
     "shopify": ("shopify", "myshopify.com"),
     "stripe": ("stripe", "stripe-subscription", "stripe machine payments"),
     "skyfire": ("skyfire",),
+    "tempo": ("tempo",),
     "x402": ("x402",),
 }
 

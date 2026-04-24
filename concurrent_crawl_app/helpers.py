@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 from urllib.parse import urljoin, urlsplit
 
 from .constants import PAYMENT_PROVIDER_MARKERS, PAYMENT_RAIL_MARKERS, TEXTUAL_CONTENT_TYPES, TITLE_RE
 from .models import FetchResponse
+
+
+TEMPLATE_PARAMETER_RE = re.compile(r"\{([^{}]+)\}")
 
 
 def normalize_content_type(content_type: str | None) -> str | None:
@@ -73,6 +77,36 @@ def resolve_url(base_url: str | None, candidate: Any) -> str | None:
         return urljoin(base_url, candidate)
     except ValueError:
         return None
+
+
+def extract_template_parameters(value: str | None) -> list[str]:
+    if not isinstance(value, str) or not value:
+        return []
+    results: list[str] = []
+    for match in TEMPLATE_PARAMETER_RE.finditer(value):
+        candidate = match.group(1).strip()
+        if candidate and candidate not in results:
+            results.append(candidate)
+    return results
+
+
+def has_template_parameters(value: str | None) -> bool:
+    return bool(extract_template_parameters(value))
+
+
+def fill_template_parameters(value: str | None, replacements: dict[str, Any]) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+
+    def replace(match: re.Match[str]) -> str:
+        key = match.group(1).strip()
+        replacement = replacements.get(key)
+        if replacement is None:
+            return match.group(0)
+        cleaned = str(replacement).strip()
+        return cleaned or match.group(0)
+
+    return TEMPLATE_PARAMETER_RE.sub(replace, value)
 
 
 def is_cross_host_redirect(fetch: FetchResponse) -> bool:

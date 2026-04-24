@@ -464,6 +464,7 @@ def classify_receipt(
             "www_authenticate_present",
             "candidate_source",
             "candidate_title",
+            "candidate_sample_title",
             "candidate_amount",
             "candidate_currency",
             "candidate_body",
@@ -509,7 +510,7 @@ def classify_receipt(
                     {
                         "method": payment_probe.facts.get("probe_method"),
                         "url": payment_probe.facts.get("probe_url"),
-                        "title": payment_probe.facts.get("candidate_title"),
+                        "title": payment_probe.facts.get("candidate_sample_title") or payment_probe.facts.get("candidate_title"),
                         "amount": payment_probe.facts.get("candidate_amount"),
                         "currency": payment_probe.facts.get("candidate_currency"),
                         "source": "payment_probe",
