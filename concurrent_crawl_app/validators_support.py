@@ -195,6 +195,16 @@ def sample_json_from_schema(
             return sample_json_from_schema(options[0], root, field_name=field_name, depth=depth + 1)
 
     schema_type = schema.get("type")
+    if isinstance(schema_type, list):
+        normalized_types = [
+            value.strip().lower()
+            for value in schema_type
+            if isinstance(value, str) and value.strip()
+        ]
+        schema_type = next(
+            (value for value in normalized_types if value != "null"),
+            normalized_types[0] if normalized_types else None,
+        )
     if not schema_type:
         if "properties" in schema:
             schema_type = "object"

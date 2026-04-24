@@ -14,6 +14,7 @@ from .ucp_catalog import probe_ucp_catalog_products
 from .validators_content import validate_ucp
 
 STORED_ARTIFACT_KEYS = frozenset({"robots_txt", "llms_txt", "llms_full_txt"})
+RETRYABLE_FETCH_ERRORS = frozenset({"timeout", "url_error:timed out"})
 
 
 def build_dynamic_probe_outcome(
@@ -27,7 +28,7 @@ def build_dynamic_probe_outcome(
     body: bytes | None = None,
     content_type: str | None = None,
 ) -> ProbeOutcome:
-    fetch = fetch_url(
+    fetch = fetch_with_retry(
         url,
         timeout=timeout,
         max_bytes=max_bytes,
@@ -37,6 +38,35 @@ def build_dynamic_probe_outcome(
     )
     spec = ProbeSpec(key=key, path=url, validator=validator, max_bytes=max_bytes)
     return build_outcome(spec, fetch)
+
+
+def fetch_with_retry(
+    url: str,
+    *,
+    timeout: float,
+    max_bytes: int,
+    method: str = "GET",
+    body: bytes | None = None,
+    content_type: str | None = None,
+) -> FetchResponse:
+    fetch = fetch_url(
+        url,
+        timeout=timeout,
+        max_bytes=max_bytes,
+        method=method,
+        body=body,
+        content_type=content_type,
+    )
+    if fetch.error in RETRYABLE_FETCH_ERRORS and method.upper() in {"GET", "HEAD"}:
+        fetch = fetch_url(
+            url,
+            timeout=timeout,
+            max_bytes=max_bytes,
+            method=method,
+            body=body,
+            content_type=content_type,
+        )
+    return fetch
 
 
 def build_payment_probe_body(candidate: dict[str, object]) -> bytes | None:
@@ -418,34 +448,16 @@ def probe_domain(domain_input: DomainInput, timeout: float, run_token: str):
     control_cache: dict[str, FetchResponse] = {}
     artifacts: dict[str, bytes] = {}
 
-    homepage_spec = BASE_PROBES[0]
-    homepage_fetch = fetch_url(f"https://{domain}{homepage_spec.path}", timeout=timeout, max_bytes=homepage_spec.max_bytes)
-    homepage_outcome = build_outcome(homepage_spec, homepage_fetch)
-    outcomes[homepage_spec.key] = homepage_outcome
+    homepage_spec = next(spec for spec in BASE_PROBES if spec.key == "homepage")
+    other_specs = [spec for spec in BASE_PROBES if spec.key != "homepage"]
 
-    root_failed_hard = homepage_fetch.status is None and homepage_fetch.error is not None
-    if root_failed_hard:
-        for spec in BASE_PROBES[1:]:
-            outcomes[spec.key] = ProbeOutcome(
-                key=spec.key,
-                path=spec.path,
-                status="skipped",
-                http_status=None,
-                content_type=None,
-                detail="Skipped after homepage network failure",
-            )
-        outcomes[PRODUCTS_PROBE.key] = ProbeOutcome(
-            key=PRODUCTS_PROBE.key,
-            path=PRODUCTS_PROBE.path,
-            status="skipped",
-            http_status=None,
-            content_type=None,
-            detail="Skipped after homepage network failure",
+    # Crawl cheap crawl/AI/discovery docs first so a slow homepage does not zero out the receipt.
+    for spec in other_specs:
+        fetch = fetch_with_retry(
+            f"https://{domain}{spec.path}",
+            timeout=timeout,
+            max_bytes=spec.max_bytes,
         )
-        return replace(classify_receipt(domain_input, outcomes), artifacts=artifacts)
-
-    for spec in BASE_PROBES[1:]:
-        fetch = fetch_url(f"https://{domain}{spec.path}", timeout=timeout, max_bytes=spec.max_bytes)
         control = None
         if spec.control_group and fetch.status == 200:
             control = build_control_fetch(domain, spec.control_group, run_token, timeout, control_cache)
@@ -459,11 +471,23 @@ def probe_domain(domain_input: DomainInput, timeout: float, run_token: str):
         ):
             artifacts[spec.key] = fetch.body
 
+    homepage_fetch = fetch_with_retry(
+        f"https://{domain}{homepage_spec.path}",
+        timeout=timeout,
+        max_bytes=homepage_spec.max_bytes,
+    )
+    homepage_outcome = build_outcome(homepage_spec, homepage_fetch)
+    outcomes[homepage_spec.key] = homepage_outcome
+
     root_ucp_outcome = outcomes.get("well_known_ucp")
     if root_ucp_outcome and root_ucp_outcome.status == "valid":
         current_version_url = root_ucp_outcome.facts.get("current_version_url")
         if isinstance(current_version_url, str) and current_version_url and current_version_url != root_ucp_outcome.final_url:
-            versioned_fetch = fetch_url(current_version_url, timeout=timeout, max_bytes=BASE_PROBES[6].max_bytes)
+            versioned_fetch = fetch_with_retry(
+                current_version_url,
+                timeout=timeout,
+                max_bytes=BASE_PROBES[6].max_bytes,
+            )
             versioned_valid, _, versioned_facts = validate_ucp(versioned_fetch)
             if versioned_valid:
                 outcomes["well_known_ucp"] = ProbeOutcome(
@@ -539,7 +563,11 @@ def probe_domain(domain_input: DomainInput, timeout: float, run_token: str):
     ]
 
     if should_probe_products(homepage_fetch, homepage_outcome, outcomes):
-        fetch = fetch_url(f"https://{domain}{PRODUCTS_PROBE.path}", timeout=timeout, max_bytes=PRODUCTS_PROBE.max_bytes)
+        fetch = fetch_with_retry(
+            f"https://{domain}{PRODUCTS_PROBE.path}",
+            timeout=timeout,
+            max_bytes=PRODUCTS_PROBE.max_bytes,
+        )
         control = None
         if PRODUCTS_PROBE.control_group and fetch.status == 200:
             control = build_control_fetch(domain, PRODUCTS_PROBE.control_group, run_token, timeout, control_cache)
@@ -589,7 +617,11 @@ def probe_domain(domain_input: DomainInput, timeout: float, run_token: str):
         outcomes[PRODUCTS_PROBE.key].status == "valid"
         or outcomes.get("api_products", ProbeOutcome("", "", "", None, None)).status == "valid"
     ):
-        fetch = fetch_url(f"https://{domain}{CART_PROBE.path}", timeout=timeout, max_bytes=CART_PROBE.max_bytes)
+        fetch = fetch_with_retry(
+            f"https://{domain}{CART_PROBE.path}",
+            timeout=timeout,
+            max_bytes=CART_PROBE.max_bytes,
+        )
         control = None
         if CART_PROBE.control_group and fetch.status == 200:
             control = build_control_fetch(domain, CART_PROBE.control_group, run_token, timeout, control_cache)
