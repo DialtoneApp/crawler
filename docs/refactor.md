@@ -77,6 +77,7 @@
 - Added x402 `extensions.bazaar.info.input` parsing so manifests that describe the payable HTTP request inline can generate a concrete probe candidate and a cleaner sample action. This fixes surfaces like `quicknode.com`, where the x402 manifest is the only public machine-readable contract.
 - Added homepage HTML discovery parsing for `rel="service-desc"`, `rel="service-meta"`, and `rel="api-catalog"`. The crawler now follows homepage-advertised OpenAPI specs like `pull.md`'s `/api/openapi.json` even when `/openapi.json` and `agent.json` are absent.
 - Added provider attribution from `PAYMENT-REQUIRED` headers by decoding JSON-like or base64url JSON envelopes and merging their hints into x402/payment-probe receipts. This makes it more likely that backing providers like `nevermined`, `asterpay`, `circle`, or similar payment engines show up in `machine_payable` receipts when the challenge header exposes them.
+- Tightened payment-probe validation so `200 text/html` landing pages or docs pages no longer count as a verified payable action. This prevents sites like `emc2ai.io` from getting `verified_payment_surface` just because a priced endpoint renders a marketing page instead of returning a real API response.
 
 ### Output model now
 

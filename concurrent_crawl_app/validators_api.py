@@ -8,6 +8,8 @@ from .helpers import (
     decode_json_like_header,
     decode_body,
     extract_template_parameters,
+    extract_title,
+    is_html_content_type,
     is_json_content_type,
     is_login_handoff_body,
     merge_unique_limited,
@@ -438,6 +440,7 @@ def validate_payment_probe(fetch: FetchResponse) -> tuple[bool, str, dict[str, A
     payment_required_header = fetch.headers.get("payment-required") or fetch.headers.get("x-payment-required")
     www_authenticate_header = fetch.headers.get("www-authenticate")
     text = decode_body(fetch.body).strip() if fetch.body else ""
+    lower_text = text.lower()
     header_payment_hints = collect_payment_hints(www_authenticate_header) if isinstance(www_authenticate_header, str) and www_authenticate_header.strip() else {}
     payment_required_payload = decode_json_like_header(payment_required_header)
     payment_required_hints = collect_payment_hints(payment_required_payload) if payment_required_payload is not None else {}
@@ -502,7 +505,24 @@ def validate_payment_probe(fetch: FetchResponse) -> tuple[bool, str, dict[str, A
                 facts["response_keys"] = sorted(str(key) for key in payload.keys())[:12]
         return True, "Payment challenge returned", facts
 
+    looks_like_html_document = (
+        is_html_content_type(fetch.content_type)
+        or "<!doctype html" in lower_text
+        or "<html" in lower_text
+        or "<head" in lower_text
+        or "<body" in lower_text
+        or "<title" in lower_text
+        or "<meta " in lower_text
+    )
     if fetch.status == 200:
+        if looks_like_html_document:
+            facts["probe_result"] = "html_landing_page"
+            if text:
+                facts["response_char_count"] = len(text)
+                title = extract_title(text)
+                if title:
+                    facts["response_title"] = title
+            return False, "Action request returned an HTML page instead of an API response", facts
         facts["probe_result"] = "success_without_payment"
         if text:
             facts["response_char_count"] = len(text)
