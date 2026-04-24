@@ -52,6 +52,24 @@
 - Added prelaunch/preorder detection from commerce status and billing-provider state, so priced offers that are documented but not yet live do not get upgraded to `machine_payable`.
 - Added agent-discovery enrichment so valid `agent.json` documents can advertise follow-up public probes such as API OpenAPI URLs and public product endpoints. The crawler now uses those advertised URLs to enrich receipts for API-first commerce sites like x402 storefronts.
 - Expanded product parsing beyond Shopify `products.json` to accept wrapped API payloads and record richer sample fields such as `sku`, `slug`, stock/preorder hints, and currency codes when publicly available.
+- Raised byte caps for large `agent.json`, `agent-card.json`, `/.well-known/commerce`, and `x402` documents so modern discovery manifests like `emc2ai.io` no longer get dropped as truncated noise.
+- Reworked HTTP outcome handling so validator-aware probes can inspect real `402 Payment Required` responses instead of collapsing them into generic `http_error`. This lets sites like `x402.quicknode.com` count as machine-payable from the actual payment challenge.
+- Added action-surface extraction for API-first commerce:
+  - OpenAPI payment-required operations now emit sample actions and runnable probe candidates.
+  - x402 manifests now emit sample actions, priced action counts, payment networks/assets, and runnable probe candidates when the document contains enough detail.
+  - agent docs now extract top-level `x402` endpoint maps and skill pricing into sample actions.
+- Added a live `payment_probe` step that executes one discovered action per domain with a synthesized request body and records whether it returns:
+  - a real `402` challenge
+  - a successful unpaid response
+  - input validation/auth boundaries
+  - temporary service failures
+- Folded those new signals into receipt classification and aggregates so positives now include:
+  - `sample_actions`
+  - `priced_action_count`
+  - `payment_probe_*`
+  - richer `x402_*` metadata
+- Expanded `callable_surface` tagging to include agent cards, x402 manifests, and verified payment probes, since many API-first sites do not expose a separate retail catalog.
+- Added payment-probe candidate ranking so the crawler prefers higher-intent actions like `send`, `buy`, `report`, or `search` over low-signal endpoints like `status` or message listing.
 
 ### Output model now
 
@@ -75,3 +93,4 @@
   - category leaderboards
   - compare pages
   - report-ready aggregates
+- Reduce noisy payment-host extraction from generic schema/docs URLs so hosts like `json-schema.org` do not leak into payment endpoint hints.

@@ -13,6 +13,7 @@ from .validators_surfaces import (
     validate_agents,
     validate_cart,
     validate_openapi,
+    validate_payment_probe,
     validate_products,
     validate_x402,
 )
@@ -28,6 +29,7 @@ VALIDATORS = {
     "agent": validate_agent,
     "agents": validate_agents,
     "openapi": validate_openapi,
+    "payment_probe": validate_payment_probe,
     "x402": validate_x402,
     "products": validate_products,
     "cart": validate_cart,

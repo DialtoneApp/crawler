@@ -7,6 +7,39 @@ from .helpers import decode_body, merge_unique_limited, normalize_status_value
 from .models import CrawlReceipt, DomainInput, ProbeOutcome
 
 
+def merge_action_samples(
+    existing: list[dict[str, Any]],
+    values: list[dict[str, Any]],
+    *,
+    limit: int = 6,
+) -> list[dict[str, Any]]:
+    merged = list(existing)
+    seen = {
+        (
+            item.get("method"),
+            item.get("url") or item.get("path"),
+            item.get("title"),
+        )
+        for item in merged
+        if isinstance(item, dict)
+    }
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+        key = (
+            value.get("method"),
+            value.get("url") or value.get("path"),
+            value.get("title"),
+        )
+        if key in seen:
+            continue
+        merged.append(dict(value))
+        seen.add(key)
+        if len(merged) >= limit:
+            break
+    return merged[:limit]
+
+
 def should_probe_products(homepage_fetch: Any, homepage_outcome: ProbeOutcome, outcomes: dict[str, ProbeOutcome]) -> bool:
     if outcomes.get("well_known_ucp", ProbeOutcome("", "", "", None, None)).status == "valid":
         return True
@@ -57,6 +90,8 @@ def merge_agent_facts(outcomes: dict[str, ProbeOutcome]) -> dict[str, Any]:
         "payment_surface",
         "crypto_only",
     }
+    sample_actions: list[dict[str, Any]] = []
+    priced_action_count = 0
     for key in ("well_known_agent_json", "root_agent_json", "well_known_agent_card"):
         outcome = outcomes.get(key)
         if not outcome or outcome.status != "valid":
@@ -71,8 +106,16 @@ def merge_agent_facts(outcomes: dict[str, ProbeOutcome]) -> dict[str, Any]:
         for fact_key in scalar_keys:
             if fact_key not in merged and outcome.facts.get(fact_key):
                 merged[fact_key] = outcome.facts[fact_key]
+        if isinstance(outcome.facts.get("sample_actions"), list):
+            sample_actions = merge_action_samples(sample_actions, outcome.facts["sample_actions"])
+        if int(outcome.facts.get("priced_action_count") or 0) > priced_action_count:
+            priced_action_count = int(outcome.facts.get("priced_action_count") or 0)
     if isinstance(merged.get("public_endpoint_urls"), list):
         merged["public_endpoint_count"] = len(merged["public_endpoint_urls"])
+    if sample_actions:
+        merged["sample_actions"] = sample_actions
+    if priced_action_count > 0:
+        merged["priced_action_count"] = priced_action_count
     return merged
 
 
@@ -97,12 +140,25 @@ def classify_receipt(
     payment_surface: str | None = None
     crypto_only = False
     commerce_docs_claim_machine_payable = False
+    sample_actions: list[dict[str, Any]] = []
+    priced_action_count = 0
 
     if "llms_txt" in valid_keys or "llms_full_txt" in valid_keys:
         tags.append("ai_readable")
     if "well_known_ucp" in valid_keys or "products_json" in valid_keys or "api_products" in valid_keys:
         tags.append("catalog_surface")
-    if {"openapi_json", "api_openapi_json", "well_known_commerce", "well_known_agent_json", "well_known_agents_json", "root_agent_json"} & valid_keys:
+    if {
+        "openapi_json",
+        "api_openapi_json",
+        "well_known_commerce",
+        "well_known_agent_json",
+        "well_known_agents_json",
+        "well_known_agent_card",
+        "root_agent_json",
+        "x402_json",
+        "x402_well_known",
+        "payment_probe",
+    } & valid_keys:
         tags.append("callable_surface")
     if {"robots_txt", "sitemap_xml"} <= valid_keys:
         tags.append("crawl_basics")
@@ -166,6 +222,8 @@ def classify_receipt(
         ):
             if key in openapi.facts:
                 aggregates[f"openapi_{key}"] = openapi.facts[key]
+        if isinstance(openapi.facts.get("sample_actions"), list):
+            sample_actions = merge_action_samples(sample_actions, openapi.facts["sample_actions"])
 
     agent_facts = merge_agent_facts(outcomes)
     if agent_facts:
@@ -194,6 +252,8 @@ def classify_receipt(
             "payment_endpoint_hosts",
             "payment_surface",
             "crypto_only",
+            "sample_actions",
+            "priced_action_count",
         ):
             if key in agent_facts:
                 aggregates[f"agent_{key}"] = agent_facts[key]
@@ -216,6 +276,10 @@ def classify_receipt(
             payment_surface = agent_facts["payment_surface"]
         if bool(agent_facts.get("crypto_only")):
             crypto_only = True
+        if isinstance(agent_facts.get("sample_actions"), list):
+            sample_actions = merge_action_samples(sample_actions, agent_facts["sample_actions"])
+        if int(agent_facts.get("priced_action_count") or 0) > priced_action_count:
+            priced_action_count = int(agent_facts.get("priced_action_count") or 0)
 
     commerce = outcomes.get("well_known_commerce")
     if commerce and commerce.status == "valid":
@@ -344,12 +408,17 @@ def classify_receipt(
             "resource_urls",
             "resource_url_count",
             "accept_count",
+            "accept_networks",
+            "accept_assets",
+            "accept_currencies",
             "instructions_char_count",
             "payment_provider_hints",
             "payment_rail_hints",
             "payment_endpoint_hosts",
             "payment_surface",
             "crypto_only",
+            "sample_actions",
+            "priced_action_count",
         ):
             if key in x402.facts:
                 aggregates[f"x402_{key}"] = x402.facts[key]
@@ -372,6 +441,10 @@ def classify_receipt(
             payment_surface = x402.facts["payment_surface"]
         if bool(x402.facts.get("crypto_only")):
             crypto_only = True
+        if isinstance(x402.facts.get("sample_actions"), list):
+            sample_actions = merge_action_samples(sample_actions, x402.facts["sample_actions"])
+        if int(x402.facts.get("priced_action_count") or 0) > priced_action_count:
+            priced_action_count = int(x402.facts.get("priced_action_count") or 0)
 
     if {"x402_json", "x402_well_known"} & valid_keys:
         payment_provider_hints = merge_unique_limited(payment_provider_hints, ["x402"], limit=12)
@@ -379,9 +452,83 @@ def classify_receipt(
         payment_surface = "x402"
         tags.append("machine_payable")
 
+    payment_probe = outcomes.get("payment_probe")
+    if payment_probe and payment_probe.status == "valid":
+        for key in (
+            "probe_method",
+            "probe_url",
+            "probe_result",
+            "response_keys",
+            "response_char_count",
+            "payment_required_header_present",
+            "www_authenticate_present",
+            "candidate_source",
+            "candidate_title",
+            "candidate_amount",
+            "candidate_currency",
+            "candidate_body",
+            "sample_actions",
+            "resource_urls",
+            "accept_count",
+            "accept_networks",
+            "accept_assets",
+            "accept_currencies",
+            "payment_provider_hints",
+            "payment_rail_hints",
+            "payment_endpoint_hosts",
+            "payment_surface",
+            "crypto_only",
+        ):
+            if key in payment_probe.facts:
+                aggregates[f"payment_probe_{key}"] = payment_probe.facts[key]
+        payment_provider_hints = merge_unique_limited(
+            payment_provider_hints,
+            payment_probe.facts.get("payment_provider_hints", []) if isinstance(payment_probe.facts.get("payment_provider_hints"), list) else [],
+            limit=12,
+        )
+        payment_rail_hints = merge_unique_limited(
+            payment_rail_hints,
+            payment_probe.facts.get("payment_rail_hints", []) if isinstance(payment_probe.facts.get("payment_rail_hints"), list) else [],
+            limit=12,
+        )
+        payment_endpoint_hosts = merge_unique_limited(
+            payment_endpoint_hosts,
+            payment_probe.facts.get("payment_endpoint_hosts", []) if isinstance(payment_probe.facts.get("payment_endpoint_hosts"), list) else [],
+            limit=12,
+        )
+        if not payment_surface and isinstance(payment_probe.facts.get("payment_surface"), str):
+            payment_surface = payment_probe.facts["payment_surface"]
+        if bool(payment_probe.facts.get("crypto_only")):
+            crypto_only = True
+        if isinstance(payment_probe.facts.get("sample_actions"), list):
+            sample_actions = merge_action_samples(sample_actions, payment_probe.facts["sample_actions"])
+        elif payment_probe.facts.get("candidate_title") or payment_probe.facts.get("probe_url"):
+            sample_actions = merge_action_samples(
+                sample_actions,
+                [
+                    {
+                        "method": payment_probe.facts.get("probe_method"),
+                        "url": payment_probe.facts.get("probe_url"),
+                        "title": payment_probe.facts.get("candidate_title"),
+                        "amount": payment_probe.facts.get("candidate_amount"),
+                        "currency": payment_probe.facts.get("candidate_currency"),
+                        "source": "payment_probe",
+                    }
+                ],
+            )
+        if payment_probe.facts.get("probe_result") in {"payment_challenge", "success_without_payment"}:
+            tags.append("machine_payable")
+            tags.append("verified_payment_surface")
+        if payment_probe.facts.get("probe_result") == "success_without_payment":
+            tags.append("free_tier_or_optional_payment")
+
     if commerce_docs_claim_machine_payable:
         tags.append("machine_payable")
 
+    if sample_actions:
+        aggregates["sample_actions"] = sample_actions
+    if priced_action_count > 0:
+        aggregates["priced_action_count"] = priced_action_count
     if payment_provider_hints:
         aggregates["payment_provider_hints"] = payment_provider_hints
     if payment_rail_hints:

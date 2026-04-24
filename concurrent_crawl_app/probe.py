@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from .classification import classify_receipt, merge_agent_facts, should_probe_products
 from .constants import BASE_PROBES, CART_PROBE, PRODUCTS_PROBE
 from .http_client import build_control_fetch, fetch_url
@@ -15,10 +17,93 @@ def build_dynamic_probe_outcome(
     validator: str,
     timeout: float,
     max_bytes: int,
+    method: str = "GET",
+    body: bytes | None = None,
+    content_type: str | None = None,
 ) -> ProbeOutcome:
-    fetch = fetch_url(url, timeout=timeout, max_bytes=max_bytes)
+    fetch = fetch_url(
+        url,
+        timeout=timeout,
+        max_bytes=max_bytes,
+        method=method,
+        body=body,
+        content_type=content_type,
+    )
     spec = ProbeSpec(key=key, path=url, validator=validator, max_bytes=max_bytes)
     return build_outcome(spec, fetch)
+
+
+def build_payment_probe_body(candidate: dict[str, object]) -> bytes | None:
+    body = candidate.get("body")
+    if body is None:
+        return None
+    if isinstance(body, bytes):
+        return body
+    if isinstance(body, str):
+        return body.encode("utf-8")
+    return json.dumps(body, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+
+
+def score_payment_probe_candidate(candidate: dict[str, object]) -> int:
+    score = 0
+    url = candidate.get("url")
+    title = candidate.get("title")
+    source = candidate.get("source")
+    text = " ".join(
+        value.lower()
+        for value in (url, title)
+        if isinstance(value, str) and value
+    )
+    negative_markers = ("status", "read", "messages", "list", "health", "stats")
+    high_intent_markers = ("buy", "order", "checkout", "purchase", "send", "report")
+    medium_intent_markers = ("search",)
+    low_intent_markers = ("scrape", "crawl")
+    if any(marker in text for marker in high_intent_markers):
+        score += 50
+    if any(marker in text for marker in medium_intent_markers):
+        score += 40
+    if any(marker in text for marker in low_intent_markers):
+        score += 20
+    if any(marker in text for marker in negative_markers):
+        score -= 20
+    if candidate.get("amount") is not None:
+        score += 15
+    body = candidate.get("body")
+    if isinstance(body, dict) and body:
+        score += 10
+    elif body is not None:
+        score += 5
+    if isinstance(source, str):
+        if source == "openapi":
+            score += 10
+        elif source == "agent_x402":
+            score += 8
+        elif source == "x402":
+            score += 6
+    return score
+
+
+def iter_payment_probe_candidates(outcomes: dict[str, ProbeOutcome]):
+    ranked_candidates: list[dict[str, object]] = []
+    for key in (
+        "api_openapi_json",
+        "openapi_json",
+        "x402_json",
+        "x402_well_known",
+        "well_known_agent_json",
+        "root_agent_json",
+        "well_known_agent_card",
+    ):
+        outcome = outcomes.get(key)
+        if not outcome or outcome.status != "valid":
+            continue
+        outcome_candidates = outcome.facts.get("payment_probe_candidates")
+        if not isinstance(outcome_candidates, list):
+            continue
+        for candidate in outcome_candidates:
+            if isinstance(candidate, dict):
+                ranked_candidates.append(candidate)
+    yield from sorted(ranked_candidates, key=score_payment_probe_candidate, reverse=True)
 
 
 def probe_domain(domain_input: DomainInput, timeout: float, run_token: str):
@@ -157,6 +242,59 @@ def probe_domain(domain_input: DomainInput, timeout: float, run_token: str):
             http_status=None,
             content_type=None,
             detail="Skipped because no valid public catalog was detected",
+        )
+
+    payment_probe_candidate = next(iter_payment_probe_candidates(outcomes), None)
+    if payment_probe_candidate:
+        candidate_url = payment_probe_candidate.get("url")
+        candidate_method = payment_probe_candidate.get("method")
+        candidate_content_type = payment_probe_candidate.get("content_type")
+        if isinstance(candidate_url, str) and candidate_url:
+            payment_probe_outcome = build_dynamic_probe_outcome(
+                key="payment_probe",
+                url=candidate_url,
+                validator="payment_probe",
+                timeout=timeout,
+                max_bytes=65_536,
+                method=candidate_method if isinstance(candidate_method, str) and candidate_method else "GET",
+                body=build_payment_probe_body(payment_probe_candidate),
+                content_type=candidate_content_type if isinstance(candidate_content_type, str) and candidate_content_type else "application/json",
+            )
+            payment_probe_facts = dict(payment_probe_outcome.facts)
+            for fact_key in ("source", "title", "amount", "currency"):
+                if fact_key in payment_probe_candidate:
+                    payment_probe_facts[f"candidate_{fact_key}"] = payment_probe_candidate[fact_key]
+            if "body" in payment_probe_candidate:
+                payment_probe_facts["candidate_body"] = payment_probe_candidate["body"]
+            outcomes["payment_probe"] = ProbeOutcome(
+                key=payment_probe_outcome.key,
+                path=payment_probe_outcome.path,
+                status=payment_probe_outcome.status,
+                http_status=payment_probe_outcome.http_status,
+                content_type=payment_probe_outcome.content_type,
+                final_url=payment_probe_outcome.final_url,
+                byte_count=payment_probe_outcome.byte_count,
+                body_sha256=payment_probe_outcome.body_sha256,
+                detail=payment_probe_outcome.detail,
+                facts=payment_probe_facts,
+            )
+        else:
+            outcomes["payment_probe"] = ProbeOutcome(
+                key="payment_probe",
+                path="dynamic",
+                status="skipped",
+                http_status=None,
+                content_type=None,
+                detail="Skipped because candidate URL was missing",
+            )
+    else:
+        outcomes["payment_probe"] = ProbeOutcome(
+            key="payment_probe",
+            path="dynamic",
+            status="skipped",
+            http_status=None,
+            content_type=None,
+            detail="Skipped because no payment probe candidate was discovered",
         )
 
     return classify_receipt(domain_input, outcomes)

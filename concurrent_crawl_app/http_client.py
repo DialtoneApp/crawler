@@ -30,15 +30,43 @@ def read_limited(response: Any, max_bytes: int) -> tuple[bytes, bool]:
     return chunk, False
 
 
-def fetch_url(url: str, timeout: float, max_bytes: int) -> FetchResponse:
+def extract_headers(headers: Any) -> dict[str, str]:
+    extracted: dict[str, str] = {}
+    if headers is None:
+        return extracted
+    for key, value in headers.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            continue
+        lowered = key.strip().lower()
+        if lowered:
+            extracted[lowered] = value.strip()
+    return extracted
+
+
+def fetch_url(
+    url: str,
+    timeout: float,
+    max_bytes: int,
+    *,
+    method: str = "GET",
+    body: bytes | None = None,
+    content_type: str | None = None,
+    extra_headers: dict[str, str] | None = None,
+) -> FetchResponse:
+    headers = {
+        "Accept": DEFAULT_ACCEPT,
+        "Connection": "close",
+        "User-Agent": USER_AGENT,
+    }
+    if content_type:
+        headers["Content-Type"] = content_type
+    if extra_headers:
+        headers.update(extra_headers)
     request = Request(
         url,
-        headers={
-            "Accept": DEFAULT_ACCEPT,
-            "Connection": "close",
-            "User-Agent": USER_AGENT,
-        },
-        method="GET",
+        data=body,
+        headers=headers,
+        method=method,
     )
 
     try:
@@ -46,11 +74,14 @@ def fetch_url(url: str, timeout: float, max_bytes: int) -> FetchResponse:
             body, truncated = read_limited(response, max_bytes)
             return FetchResponse(
                 requested_url=url,
+                request_method=method.upper(),
+                request_content_type=content_type,
                 final_url=response.geturl(),
                 status=response.status,
                 content_type=response.headers.get("Content-Type"),
                 body=body,
                 truncated=truncated,
+                headers=extract_headers(response.headers),
             )
     except HTTPError as error:
         body = b""
@@ -62,19 +93,37 @@ def fetch_url(url: str, timeout: float, max_bytes: int) -> FetchResponse:
             truncated = False
         return FetchResponse(
             requested_url=url,
+            request_method=method.upper(),
+            request_content_type=content_type,
             final_url=error.geturl(),
             status=error.code,
             content_type=error.headers.get("Content-Type"),
             body=body,
             truncated=truncated,
             error=f"http_{error.code}",
+            headers=extract_headers(error.headers),
         )
     except TimeoutError:
-        return FetchResponse(requested_url=url, error="timeout")
+        return FetchResponse(
+            requested_url=url,
+            request_method=method.upper(),
+            request_content_type=content_type,
+            error="timeout",
+        )
     except URLError as error:
-        return FetchResponse(requested_url=url, error=f"url_error:{error.reason}")
+        return FetchResponse(
+            requested_url=url,
+            request_method=method.upper(),
+            request_content_type=content_type,
+            error=f"url_error:{error.reason}",
+        )
     except (http.client.HTTPException, OSError, ssl.SSLError, UnicodeError) as error:
-        return FetchResponse(requested_url=url, error=error.__class__.__name__)
+        return FetchResponse(
+            requested_url=url,
+            request_method=method.upper(),
+            request_content_type=content_type,
+            error=error.__class__.__name__,
+        )
 
 
 def control_path_for_group(group: str, run_token: str) -> str:

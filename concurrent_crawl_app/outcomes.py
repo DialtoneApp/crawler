@@ -11,6 +11,14 @@ from .helpers import (
 from .models import CrawlReceipt, FetchResponse, ProbeOutcome, ProbeSpec
 from .validation import VALIDATORS
 
+VALIDATOR_HTTP_STATUSES: dict[str, set[int]] = {
+    "commerce": {200, 402},
+    "payment_probe": {200, 400, 401, 402, 403, 405, 409, 422, 429, 503},
+    "x402": {200, 402},
+}
+
+ALLOW_EMPTY_BODY_VALIDATORS = {"payment_probe", "x402"}
+
 
 def merge_ucp_facts(primary: dict[str, Any], enriched: dict[str, Any]) -> dict[str, Any]:
     merged = dict(primary)
@@ -85,7 +93,8 @@ def build_outcome(
             detail=fetch.error,
         )
 
-    if fetch.status != 200:
+    allowed_statuses = VALIDATOR_HTTP_STATUSES.get(spec.validator, {200})
+    if fetch.status not in allowed_statuses:
         return ProbeOutcome(
             key=spec.key,
             path=spec.path,
@@ -98,7 +107,7 @@ def build_outcome(
             detail=f"HTTP {fetch.status}",
         )
 
-    if spec.key != "homepage" and fetch.byte_count == 0:
+    if spec.key != "homepage" and fetch.byte_count == 0 and spec.validator not in ALLOW_EMPTY_BODY_VALIDATORS:
         return ProbeOutcome(
             key=spec.key,
             path=spec.path,

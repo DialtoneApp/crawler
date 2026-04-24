@@ -24,12 +24,15 @@ class ProbeSpec:
 @dataclass
 class FetchResponse:
     requested_url: str
+    request_method: str = "GET"
+    request_content_type: str | None = None
     final_url: str | None = None
     status: int | None = None
     content_type: str | None = None
     body: bytes = b""
     truncated: bool = False
     error: str | None = None
+    headers: dict[str, str] = field(default_factory=dict)
 
     @property
     def byte_count(self) -> int:
