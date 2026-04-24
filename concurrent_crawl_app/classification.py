@@ -257,6 +257,10 @@ def classify_receipt(
         title = homepage.facts.get("title")
         if homepage.facts.get("shopify_hint"):
             tags.append("shopify_hint")
+        for fact_key in ("favicon_url", "og_image_url"):
+            value = homepage.facts.get(fact_key)
+            if isinstance(value, str) and value.strip():
+                aggregates[fact_key] = value.strip()
 
     if limited_outcomes:
         tags.append("rate_limited")

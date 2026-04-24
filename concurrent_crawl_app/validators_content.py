@@ -9,7 +9,9 @@ from .helpers import (
     derive_x402_discovery_url,
     extract_observed_json_schema_facts,
     extract_absolute_urls,
+    extract_favicon_url,
     extract_link_urls_by_rel,
+    extract_meta_content,
     extract_title,
     final_host,
     flatten_strings,
@@ -50,6 +52,15 @@ def validate_homepage(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
     service_desc_urls = extract_link_urls_by_rel(text, rel_token="service-desc", base_url=base_reference)
     service_meta_urls = extract_link_urls_by_rel(text, rel_token="service-meta", base_url=base_reference)
     api_catalog_urls = extract_link_urls_by_rel(text, rel_token="api-catalog", base_url=base_reference)
+    favicon_url = extract_favicon_url(text, base_url=base_reference)
+    og_image_url = extract_meta_content(
+        text,
+        property_names=("og:image:secure_url", "og:image"),
+        name_names=("twitter:image", "twitter:image:src"),
+        itemprop_names=("image",),
+        base_url=base_reference,
+        resolve_as_url=True,
+    )
     facts = {"title": title, "shopify_hint": shopify_hint}
     if service_desc_urls:
         facts["service_desc_urls"] = service_desc_urls
@@ -57,6 +68,10 @@ def validate_homepage(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
         facts["service_meta_urls"] = service_meta_urls
     if api_catalog_urls:
         facts["api_catalog_urls"] = api_catalog_urls
+    if favicon_url:
+        facts["favicon_url"] = favicon_url
+    if og_image_url:
+        facts["og_image_url"] = og_image_url
 
     if is_html_content_type(fetch.content_type) or "<html" in lower_text or title:
         return True, "Fetched homepage HTML", facts

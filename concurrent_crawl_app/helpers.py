@@ -15,6 +15,7 @@ TEMPLATE_PARAMETER_RE = re.compile(r"\{([^{}]+)\}")
 COLON_PARAMETER_RE = re.compile(r"(?:(?<=/)|^):([a-zA-Z_][a-zA-Z0-9_]*)")
 ABSOLUTE_URL_RE = re.compile(r"https?://[^\s<>()\"']+")
 LINK_TAG_RE = re.compile(r"<link\b[^>]*>", re.IGNORECASE)
+META_TAG_RE = re.compile(r"<meta\b[^>]*>", re.IGNORECASE)
 HTML_ATTR_RE = re.compile(r'([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*("([^"]*)"|\'([^\']*)\'|([^\s>]+))')
 HTTP_METHOD_PREFIX_RE = re.compile(r"^\s*([A-Z]+)\s+(/.*)$")
 
@@ -85,6 +86,19 @@ def resolve_url(base_url: str | None, candidate: Any) -> str | None:
         return urljoin(base_url, candidate)
     except ValueError:
         return None
+
+
+def resolve_http_url(base_url: str | None, candidate: Any) -> str | None:
+    resolved = resolve_url(base_url, candidate)
+    if not isinstance(resolved, str) or not resolved:
+        return None
+    try:
+        parsed = urlsplit(resolved)
+    except ValueError:
+        return None
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    return resolved
 
 
 def resolve_openapi_path(base_url: str | None, candidate: Any) -> str | None:
@@ -218,10 +232,113 @@ def extract_link_urls_by_rel(text: str, *, rel_token: str, base_url: str | None 
         rel_tokens = {part.strip().lower() for part in rel_value.split() if part.strip()}
         if rel_lower not in rel_tokens:
             continue
-        resolved_url = resolve_url(base_url, href_value) or href_value.strip()
+        resolved_url = resolve_http_url(base_url, href_value)
         if resolved_url and resolved_url not in urls:
             urls.append(resolved_url)
     return urls
+
+
+def extract_meta_content(
+    text: str,
+    *,
+    property_names: tuple[str, ...] = (),
+    name_names: tuple[str, ...] = (),
+    itemprop_names: tuple[str, ...] = (),
+    base_url: str | None = None,
+    resolve_as_url: bool = False,
+) -> str | None:
+    if not isinstance(text, str) or not text:
+        return None
+
+    property_candidates = tuple(
+        value.strip().lower()
+        for value in property_names
+        if isinstance(value, str) and value.strip()
+    )
+    name_candidates = tuple(
+        value.strip().lower()
+        for value in name_names
+        if isinstance(value, str) and value.strip()
+    )
+    itemprop_candidates = tuple(
+        value.strip().lower()
+        for value in itemprop_names
+        if isinstance(value, str) and value.strip()
+    )
+    tags = [parse_html_attributes(match.group(0)) for match in META_TAG_RE.finditer(text)]
+    if not tags:
+        return None
+
+    def read_value(raw_value: str | None) -> str | None:
+        if not isinstance(raw_value, str):
+            return None
+        cleaned = html.unescape(raw_value.strip())
+        if not cleaned:
+            return None
+        if resolve_as_url:
+            return resolve_http_url(base_url, cleaned)
+        return cleaned
+
+    for property_name in property_candidates:
+        for attrs in tags:
+            if attrs.get("property", "").strip().lower() != property_name:
+                continue
+            value = read_value(attrs.get("content"))
+            if value:
+                return value
+
+    for name_name in name_candidates:
+        for attrs in tags:
+            if attrs.get("name", "").strip().lower() != name_name:
+                continue
+            value = read_value(attrs.get("content"))
+            if value:
+                return value
+
+    for itemprop_name in itemprop_candidates:
+        for attrs in tags:
+            if attrs.get("itemprop", "").strip().lower() != itemprop_name:
+                continue
+            value = read_value(attrs.get("content"))
+            if value:
+                return value
+
+    return None
+
+
+def extract_favicon_url(text: str, *, base_url: str | None = None) -> str | None:
+    if not isinstance(text, str) or not text:
+        return None
+
+    tags = [parse_html_attributes(match.group(0)) for match in LINK_TAG_RE.finditer(text)]
+    if not tags:
+        return None
+
+    relation_priorities = (
+        ("shortcut", "icon"),
+        ("icon",),
+        ("apple-touch-icon-precomposed",),
+        ("apple-touch-icon",),
+        ("mask-icon",),
+    )
+
+    for required_tokens in relation_priorities:
+        for attrs in tags:
+            rel_tokens = {
+                part.strip().lower()
+                for part in attrs.get("rel", "").split()
+                if part.strip()
+            }
+            if not rel_tokens or not all(token in rel_tokens for token in required_tokens):
+                continue
+            href_value = attrs.get("href")
+            if not href_value:
+                continue
+            resolved = resolve_http_url(base_url, href_value)
+            if resolved:
+                return resolved
+
+    return None
 
 
 def extract_template_parameters(value: str | None) -> list[str]:
