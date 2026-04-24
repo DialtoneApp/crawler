@@ -283,12 +283,22 @@ def heuristic_sample_body(candidate: str | None, method: str) -> Any:
     if method.upper() not in {"POST", "PUT", "PATCH"}:
         return None
     lowered = (candidate or "").lower()
+    if "/api/submit" in lowered or lowered.endswith("/submit"):
+        return {
+            "name": "Sample Service",
+            "description": "A service that accepts x402 payments",
+            "category": "api",
+            "url": "https://example.com/api",
+            "protocol": "x402",
+        }
     if "serp" in lowered or "/search" in lowered:
         return {"q": "openai"}
     if "scrape" in lowered:
         return {"url": "https://example.com"}
     if "crawl" in lowered:
         return {"url": "https://example.com", "maxPages": 1}
+    if "/inbox/" in lowered or lowered.endswith("/inbox"):
+        return {"content": "Test message"}
     if "report" in lowered or "analysis" in lowered or "chat" in lowered:
         return {"prompt": "test"}
     if "subdomain" in lowered and "buy" in lowered:
@@ -333,7 +343,7 @@ def extract_x402_actions(
     *,
     base_reference: str,
     services: list[Any] | None = None,
-    endpoints: dict[str, Any] | None = None,
+    endpoints: Any = None,
     source: str,
 ) -> tuple[list[str], list[dict[str, Any]], list[dict[str, Any]], int, list[str]]:
     resource_urls: list[str] = []
@@ -389,7 +399,20 @@ def extract_x402_actions(
         if candidate:
             probe_candidates = merge_probe_candidates(probe_candidates, [candidate])
 
-    for raw_path, endpoint in (endpoints or {}).items():
+    endpoint_items: list[tuple[str, dict[str, Any]]] = []
+    if isinstance(endpoints, dict):
+        for raw_path, endpoint in endpoints.items():
+            if isinstance(endpoint, dict):
+                endpoint_items.append((str(raw_path), endpoint))
+    elif isinstance(endpoints, list):
+        for endpoint in endpoints:
+            if not isinstance(endpoint, dict):
+                continue
+            raw_path = endpoint.get("path") or endpoint.get("url") or endpoint.get("resource") or endpoint.get("endpoint")
+            if isinstance(raw_path, str) and raw_path.strip():
+                endpoint_items.append((raw_path.strip(), endpoint))
+
+    for raw_path, endpoint in endpoint_items:
         if not isinstance(endpoint, dict):
             continue
         resolved_url = resolve_url(base_reference, raw_path)

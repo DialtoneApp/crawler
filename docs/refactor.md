@@ -78,6 +78,13 @@
 - Added homepage HTML discovery parsing for `rel="service-desc"`, `rel="service-meta"`, and `rel="api-catalog"`. The crawler now follows homepage-advertised OpenAPI specs like `pull.md`'s `/api/openapi.json` even when `/openapi.json` and `agent.json` are absent.
 - Added provider attribution from `PAYMENT-REQUIRED` headers by decoding JSON-like or base64url JSON envelopes and merging their hints into x402/payment-probe receipts. This makes it more likely that backing providers like `nevermined`, `asterpay`, `circle`, or similar payment engines show up in `machine_payable` receipts when the challenge header exposes them.
 - Tightened payment-probe validation so `200 text/html` landing pages or docs pages no longer count as a verified payable action. This prevents sites like `emc2ai.io` from getting `verified_payment_surface` just because a priced endpoint renders a marketing page instead of returning a real API response.
+- Expanded agent-discovery parsing to catch more real API/payment surfaces:
+  - root `openApiUrl` / `openapiUrl`
+  - `documentation.openApiSpec`
+  - `links.documentation`
+  - nested string endpoint maps like `endpoints.rest.agents`
+- Added template-probe fallback discovery from agent-listed public endpoints, so templated paid routes like `aibtc.com/api/inbox/{address}` can resolve a real resource ID even when the OpenAPI path has no obvious sibling collection route.
+- Extended x402 parsing to handle list-style endpoint manifests and improved probe-body heuristics for paid submission/inbox flows. This lets simple manifests like `a2alist.ai` generate a real `payment_probe`, and it avoids placeholder `"string"` request bodies when a better URL-based heuristic exists.
 
 ### Output model now
 

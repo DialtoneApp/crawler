@@ -146,7 +146,7 @@ def validate_openapi(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
                     ],
                 )
                 sample_content_type, sample_body = sample_request_from_operation(operation, payload)
-                if sample_body is None:
+                if sample_body is None or sample_body == "string":
                     sample_body = heuristic_sample_body(resolved_url or str(path_name), method_name.upper())
                 candidate = build_probe_candidate(
                     url=resolved_url,
@@ -166,6 +166,38 @@ def validate_openapi(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
                             discovery_url = resolve_url(base_reference, collection_path)
                             if discovery_url:
                                 candidate["discovery_url"] = discovery_url
+                        if "discovery_url" not in candidate:
+                            inferred_discovery_urls: list[str] = []
+                            for candidate_path, candidate_path_item in readable_paths.items():
+                                if candidate_path == path_name or extract_template_parameters(candidate_path):
+                                    continue
+                                candidate_get = candidate_path_item.get("get")
+                                if not isinstance(candidate_get, dict):
+                                    continue
+                                candidate_text = " ".join(
+                                    value.lower()
+                                    for value in (
+                                        candidate_path,
+                                        candidate_get.get("summary"),
+                                        candidate_get.get("operationId"),
+                                        candidate_get.get("description"),
+                                    )
+                                    if isinstance(value, str) and value
+                                )
+                                score = 0
+                                if candidate_path.startswith("/api/"):
+                                    score += 5
+                                if any(marker in candidate_text for marker in ("agents", "products", "assets", "resources", "servers", "catalog", "registry", "directory")):
+                                    score += 40
+                                if any(marker in candidate_text for marker in ("list", "browse", "search", "index")):
+                                    score += 20
+                                if score <= 0:
+                                    continue
+                                resolved_discovery_url = resolve_url(base_reference, candidate_path)
+                                if isinstance(resolved_discovery_url, str) and resolved_discovery_url and resolved_discovery_url not in inferred_discovery_urls:
+                                    inferred_discovery_urls.append(resolved_discovery_url)
+                            if inferred_discovery_urls:
+                                candidate["discovery_urls"] = inferred_discovery_urls[:6]
                         resource_path = path_name.rsplit("/", 1)[0] if "/" in path_name else path_name
                         for lookup_suffix in ("/price", "/pricing", "/quote"):
                             lookup_path = f"{resource_path}{lookup_suffix}"
@@ -257,7 +289,7 @@ def validate_x402(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
             resource_urls, sample_actions, probe_candidates, priced_action_count, priced_action_currencies = extract_x402_actions(
                 base_reference=base_reference,
                 services=payload.get("services") if isinstance(payload.get("services"), list) else [],
-                endpoints=payload.get("endpoints") if isinstance(payload.get("endpoints"), dict) else {},
+                endpoints=payload.get("endpoints"),
                 source="x402",
             )
             primary_resource: dict[str, Any] | None = resources[0] if resources and isinstance(resources[0], dict) else None

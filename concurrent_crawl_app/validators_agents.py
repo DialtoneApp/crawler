@@ -14,6 +14,32 @@ from .validators_support import (
 )
 
 
+def first_resolved_url(base_reference: str, *candidates: Any) -> str | None:
+    for candidate in candidates:
+        resolved = resolve_url(base_reference, candidate)
+        if isinstance(resolved, str) and resolved:
+            return resolved
+    return None
+
+
+def iter_named_endpoints(value: Any, prefix: str = ""):
+    if isinstance(value, str):
+        if prefix:
+            yield prefix, {"path": value}
+        return
+    if not isinstance(value, dict):
+        return
+
+    raw_path = value.get("path") or value.get("url") or value.get("endpoint") or value.get("href")
+    if isinstance(raw_path, str) and raw_path.strip():
+        yield prefix, value
+        return
+
+    for key, child in value.items():
+        child_prefix = f"{prefix}.{key}" if prefix else str(key)
+        yield from iter_named_endpoints(child, child_prefix)
+
+
 def validate_agent(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
     if fetch.truncated:
         return False, f"agent response truncated at {fetch.byte_count} bytes", {"truncated": True}
@@ -50,14 +76,32 @@ def validate_agent(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
     api = payload.get("api") if isinstance(payload.get("api"), dict) else {}
     authentication = payload.get("authentication") if isinstance(payload.get("authentication"), dict) else {}
     discovery = payload.get("discovery") if isinstance(payload.get("discovery"), dict) else {}
+    documentation = payload.get("documentation") if isinstance(payload.get("documentation"), dict) else {}
     endpoints = payload.get("endpoints") if isinstance(payload.get("endpoints"), dict) else {}
+    links = payload.get("links") if isinstance(payload.get("links"), dict) else {}
     payment = payload.get("payment") if isinstance(payload.get("payment"), dict) else {}
     x402 = payload.get("x402") if isinstance(payload.get("x402"), dict) else {}
     skills = payload.get("skills") if isinstance(payload.get("skills"), list) else []
 
     api_base_url = resolve_url(base_reference, api.get("base_url"))
-    docs_url = resolve_url(base_reference, api.get("docs")) or resolve_url(base_reference, discovery.get("docs"))
-    openapi_url = resolve_url(base_reference, discovery.get("openapi")) or resolve_url(base_reference, api.get("openapi"))
+    docs_url = first_resolved_url(
+        base_reference,
+        api.get("docs"),
+        discovery.get("docs"),
+        payload.get("documentationUrl"),
+        documentation.get("quickStart"),
+        documentation.get("fullReference"),
+        links.get("documentation"),
+    )
+    openapi_url = first_resolved_url(
+        base_reference,
+        discovery.get("openapi"),
+        api.get("openapi"),
+        payload.get("openApiUrl"),
+        payload.get("openapiUrl"),
+        documentation.get("openApiSpec"),
+        links.get("documentation"),
+    )
     x402_url = (
         resolve_url(base_reference, discovery.get("x402"))
         or resolve_url(base_reference, x402.get("url"))
@@ -76,24 +120,28 @@ def validate_agent(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
     register_urls: list[str] = []
     wallet_guides_urls: list[str] = []
 
-    for endpoint_name, endpoint in endpoints.items():
-        if not isinstance(endpoint, dict):
-            continue
-        raw_path = endpoint.get("path")
+    for endpoint_name, endpoint in iter_named_endpoints(endpoints):
+        endpoint_name_leaf = endpoint_name.rsplit(".", 1)[-1] if endpoint_name else ""
+        raw_path = (
+            endpoint.get("path")
+            or endpoint.get("url")
+            or endpoint.get("endpoint")
+            or endpoint.get("href")
+        )
         resolved_url = resolve_url(api_base_url or base_reference, raw_path)
         auth_required = endpoint.get("auth")
-        if resolved_url and auth_required is False:
+        if resolved_url and auth_required is not True:
             public_endpoint_urls = merge_unique_limited(public_endpoint_urls, [resolved_url], limit=12)
 
-        if endpoint_name == "products" and resolved_url:
+        if endpoint_name_leaf == "products" and resolved_url:
             product_urls = merge_unique_limited(product_urls, [resolved_url], limit=6)
-        elif endpoint_name == "docs" and resolved_url:
+        elif endpoint_name_leaf == "docs" and resolved_url:
             docs_urls = merge_unique_limited(docs_urls, [resolved_url], limit=6)
-        elif endpoint_name == "orders" and resolved_url:
+        elif endpoint_name_leaf == "orders" and resolved_url:
             order_urls = merge_unique_limited(order_urls, [resolved_url], limit=6)
-        elif endpoint_name == "register" and resolved_url:
+        elif endpoint_name_leaf == "register" and resolved_url:
             register_urls = merge_unique_limited(register_urls, [resolved_url], limit=6)
-        elif endpoint_name == "wallet_guides" and resolved_url:
+        elif endpoint_name_leaf == "wallet_guides" and resolved_url:
             wallet_guides_urls = merge_unique_limited(wallet_guides_urls, [resolved_url], limit=6)
 
     payment_protocol = payment.get("protocol") if isinstance(payment.get("protocol"), str) else None

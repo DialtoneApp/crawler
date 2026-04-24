@@ -137,6 +137,18 @@ def candidate_keys_for_parameter(parameter: str) -> list[str]:
     if not lowered:
         return []
     results = [lowered]
+    if lowered == "address":
+        results.extend(
+            [
+                "btc_address",
+                "btcaddress",
+                "stx_address",
+                "stxaddress",
+                "wallet_address",
+                "wallet",
+                "recipient_address",
+            ]
+        )
     if lowered == "slug":
         results.extend(["handle"])
     if lowered.endswith("_id"):
@@ -229,7 +241,12 @@ def extract_price_payload_details(fetch: FetchResponse) -> tuple[str | None, str
     return amount, currency
 
 
-def resolve_template_candidate(candidate: dict[str, object], timeout: float) -> tuple[dict[str, object] | None, str | None]:
+def resolve_template_candidate(
+    candidate: dict[str, object],
+    timeout: float,
+    *,
+    fallback_discovery_urls: list[str] | None = None,
+) -> tuple[dict[str, object] | None, str | None]:
     candidate_url = candidate.get("url")
     if not isinstance(candidate_url, str) or not candidate_url:
         return None, "Skipped payment probe candidate without a URL"
@@ -242,35 +259,54 @@ def resolve_template_candidate(candidate: dict[str, object], timeout: float) -> 
     if not parameter_names:
         return dict(candidate), None
 
-    discovery_url = candidate.get("discovery_url")
-    if not isinstance(discovery_url, str) or not discovery_url:
+    discovery_urls: list[str] = []
+    primary_discovery_url = candidate.get("discovery_url")
+    if isinstance(primary_discovery_url, str) and primary_discovery_url:
+        discovery_urls.append(primary_discovery_url)
+    candidate_discovery_urls = candidate.get("discovery_urls")
+    if isinstance(candidate_discovery_urls, list):
+        for value in candidate_discovery_urls:
+            if isinstance(value, str) and value and value not in discovery_urls:
+                discovery_urls.append(value)
+    for value in fallback_discovery_urls or []:
+        if isinstance(value, str) and value and value not in discovery_urls:
+            discovery_urls.append(value)
+    if not discovery_urls:
         return None, "Skipped templated payment probe candidate without a discovery URL"
-
-    discovery_fetch = fetch_url(discovery_url, timeout=timeout, max_bytes=131_072)
-    if discovery_fetch.status != 200:
-        return None, f"Skipped templated payment probe candidate after discovery fetch returned HTTP {discovery_fetch.status}"
-
-    try:
-        payload = parse_json_body(discovery_fetch)
-    except (ValueError, json.JSONDecodeError):
-        return None, "Skipped templated payment probe candidate because the discovery URL did not return JSON"
 
     selected_item: dict[str, Any] | None = None
     replacements: dict[str, Any] = {}
-    for item in iter_collection_items(payload):
-        candidate_replacements: dict[str, Any] = {}
-        for parameter_name in parameter_names:
-            parameter_value = extract_parameter_value(item, parameter_name)
-            if parameter_value is None:
+    resolved_discovery_url: str | None = None
+    resolution_detail = "Skipped templated payment probe candidate because the discovery response did not expose concrete resource IDs"
+    for discovery_url in discovery_urls:
+        discovery_fetch = fetch_url(discovery_url, timeout=timeout, max_bytes=131_072)
+        if discovery_fetch.status != 200:
+            resolution_detail = f"Skipped templated payment probe candidate after discovery fetch returned HTTP {discovery_fetch.status}"
+            continue
+
+        try:
+            payload = parse_json_body(discovery_fetch)
+        except (ValueError, json.JSONDecodeError):
+            resolution_detail = "Skipped templated payment probe candidate because the discovery URL did not return JSON"
+            continue
+
+        for item in iter_collection_items(payload):
+            candidate_replacements: dict[str, Any] = {}
+            for parameter_name in parameter_names:
+                parameter_value = extract_parameter_value(item, parameter_name)
+                if parameter_value is None:
+                    break
+                candidate_replacements[parameter_name] = parameter_value
+            else:
+                selected_item = item
+                replacements = candidate_replacements
+                resolved_discovery_url = discovery_url
                 break
-            candidate_replacements[parameter_name] = parameter_value
-        else:
-            selected_item = item
-            replacements = candidate_replacements
+        if selected_item and replacements:
             break
 
     if not selected_item or not replacements:
-        return None, "Skipped templated payment probe candidate because the discovery response did not expose concrete resource IDs"
+        return None, resolution_detail
 
     resolved_url = fill_template_parameters(candidate_url, replacements)
     if not isinstance(resolved_url, str) or not resolved_url or extract_template_parameters(resolved_url):
@@ -279,7 +315,8 @@ def resolve_template_candidate(candidate: dict[str, object], timeout: float) -> 
     resolved_candidate = dict(candidate)
     resolved_candidate["url"] = resolved_url
     resolved_candidate["resolved_from_template"] = True
-    resolved_candidate["discovery_url"] = discovery_url
+    if resolved_discovery_url:
+        resolved_candidate["discovery_url"] = resolved_discovery_url
     resolved_candidate["resolved_parameters"] = replacements
 
     if not resolved_candidate.get("title"):
@@ -535,8 +572,19 @@ def probe_domain(domain_input: DomainInput, timeout: float, run_token: str):
 
     payment_probe_candidate: dict[str, object] | None = None
     payment_probe_skip_detail = "Skipped because no payment probe candidate was discovered"
+    fallback_discovery_urls: list[str] = []
+    for fact_key in ("public_endpoint_urls", "product_urls", "order_urls", "register_urls"):
+        values = agent_facts.get(fact_key)
+        if isinstance(values, list):
+            for value in values:
+                if isinstance(value, str) and value and value not in fallback_discovery_urls:
+                    fallback_discovery_urls.append(value)
     for raw_candidate in iter_payment_probe_candidates(outcomes):
-        resolved_candidate, resolution_detail = resolve_template_candidate(raw_candidate, timeout)
+        resolved_candidate, resolution_detail = resolve_template_candidate(
+            raw_candidate,
+            timeout,
+            fallback_discovery_urls=fallback_discovery_urls,
+        )
         if resolved_candidate is not None:
             payment_probe_candidate = resolved_candidate
             break
