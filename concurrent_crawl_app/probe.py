@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import replace
 from typing import Any
 
@@ -15,6 +16,62 @@ from .validators_content import validate_ucp
 
 STORED_ARTIFACT_KEYS = frozenset({"robots_txt", "llms_txt", "llms_full_txt"})
 RETRYABLE_FETCH_ERRORS = frozenset({"timeout", "url_error:timed out"})
+
+
+def finalize_receipt(
+    domain_input: DomainInput,
+    outcomes: dict[str, ProbeOutcome],
+    artifacts: dict[str, bytes],
+    *,
+    started_at: float,
+    wall_clock_limit: float | None,
+    wall_clock_timeout: bool = False,
+):
+    receipt = classify_receipt(domain_input, outcomes)
+    if wall_clock_timeout:
+        aggregates = dict(receipt.aggregates)
+        aggregates["domain_wall_clock_timeout"] = True
+        aggregates["domain_wall_clock_elapsed_seconds"] = round(max(time.monotonic() - started_at, 0.0), 3)
+        if wall_clock_limit and wall_clock_limit > 0:
+            aggregates["domain_wall_clock_limit_seconds"] = round(wall_clock_limit, 3)
+        receipt = replace(receipt, aggregates=aggregates)
+    return replace(receipt, artifacts=artifacts)
+
+
+def wall_clock_deadline_reached(started_at: float, wall_clock_limit: float | None) -> bool:
+    return bool(wall_clock_limit and wall_clock_limit > 0 and (time.monotonic() - started_at) >= wall_clock_limit)
+
+
+def maybe_abort_for_wall_clock(
+    domain_input: DomainInput,
+    outcomes: dict[str, ProbeOutcome],
+    artifacts: dict[str, bytes],
+    *,
+    started_at: float,
+    wall_clock_limit: float | None,
+    detail: str,
+):
+    if not wall_clock_deadline_reached(started_at, wall_clock_limit):
+        return None
+
+    if "payment_probe" not in outcomes:
+        outcomes["payment_probe"] = ProbeOutcome(
+            key="payment_probe",
+            path="dynamic",
+            status="skipped",
+            http_status=None,
+            content_type=None,
+            detail=detail,
+        )
+
+    return finalize_receipt(
+        domain_input,
+        outcomes,
+        artifacts,
+        started_at=started_at,
+        wall_clock_limit=wall_clock_limit,
+        wall_clock_timeout=True,
+    )
 
 
 def build_dynamic_probe_outcome(
@@ -442,17 +499,33 @@ def iter_remote_x402_candidate_urls(
         yield candidate_url
 
 
-def probe_domain(domain_input: DomainInput, timeout: float, run_token: str):
+def probe_domain(
+    domain_input: DomainInput,
+    timeout: float,
+    run_token: str,
+    wall_clock_limit: float | None = None,
+):
     domain = domain_input.domain
     outcomes: dict[str, ProbeOutcome] = {}
     control_cache: dict[str, FetchResponse] = {}
     artifacts: dict[str, bytes] = {}
+    started_at = time.monotonic()
 
     homepage_spec = next(spec for spec in BASE_PROBES if spec.key == "homepage")
     other_specs = [spec for spec in BASE_PROBES if spec.key != "homepage"]
 
     # Crawl cheap crawl/AI/discovery docs first so a slow homepage does not zero out the receipt.
     for spec in other_specs:
+        timeout_receipt = maybe_abort_for_wall_clock(
+            domain_input,
+            outcomes,
+            artifacts,
+            started_at=started_at,
+            wall_clock_limit=wall_clock_limit,
+            detail="Skipped after per-domain wall-clock limit was reached before base probe fetches completed",
+        )
+        if timeout_receipt is not None:
+            return timeout_receipt
         fetch = fetch_with_retry(
             f"https://{domain}{spec.path}",
             timeout=timeout,
@@ -471,6 +544,32 @@ def probe_domain(domain_input: DomainInput, timeout: float, run_token: str):
         ):
             artifacts[spec.key] = fetch.body
 
+    timeout_receipt = maybe_abort_for_wall_clock(
+        domain_input,
+        outcomes,
+        artifacts,
+        started_at=started_at,
+        wall_clock_limit=wall_clock_limit,
+        detail="Skipped after per-domain wall-clock limit was reached before homepage fetch",
+    )
+    if timeout_receipt is not None:
+        outcomes["homepage"] = ProbeOutcome(
+            key="homepage",
+            path=homepage_spec.path,
+            status="skipped",
+            http_status=None,
+            content_type=None,
+            detail="Skipped after per-domain wall-clock limit was reached before homepage fetch",
+        )
+        return finalize_receipt(
+            domain_input,
+            outcomes,
+            artifacts,
+            started_at=started_at,
+            wall_clock_limit=wall_clock_limit,
+            wall_clock_timeout=True,
+        )
+
     homepage_fetch = fetch_with_retry(
         f"https://{domain}{homepage_spec.path}",
         timeout=timeout,
@@ -481,6 +580,16 @@ def probe_domain(domain_input: DomainInput, timeout: float, run_token: str):
 
     root_ucp_outcome = outcomes.get("well_known_ucp")
     if root_ucp_outcome and root_ucp_outcome.status == "valid":
+        timeout_receipt = maybe_abort_for_wall_clock(
+            domain_input,
+            outcomes,
+            artifacts,
+            started_at=started_at,
+            wall_clock_limit=wall_clock_limit,
+            detail="Skipped after per-domain wall-clock limit was reached during UCP enrichment",
+        )
+        if timeout_receipt is not None:
+            return timeout_receipt
         current_version_url = root_ucp_outcome.facts.get("current_version_url")
         if isinstance(current_version_url, str) and current_version_url and current_version_url != root_ucp_outcome.final_url:
             versioned_fetch = fetch_with_retry(
@@ -518,6 +627,16 @@ def probe_domain(domain_input: DomainInput, timeout: float, run_token: str):
     ]
     if outcomes.get("openapi_json") and outcomes["openapi_json"].status != "valid" and openapi_candidate_urls:
         for candidate_url in openapi_candidate_urls:
+            timeout_receipt = maybe_abort_for_wall_clock(
+                domain_input,
+                outcomes,
+                artifacts,
+                started_at=started_at,
+                wall_clock_limit=wall_clock_limit,
+                detail="Skipped after per-domain wall-clock limit was reached during OpenAPI discovery",
+            )
+            if timeout_receipt is not None:
+                return timeout_receipt
             if candidate_url == outcomes["openapi_json"].final_url or candidate_url == f"https://{domain}/openapi.json":
                 continue
             api_openapi_outcome = build_dynamic_probe_outcome(
@@ -541,6 +660,16 @@ def probe_domain(domain_input: DomainInput, timeout: float, run_token: str):
     )
     if local_x402_outcome is None:
         for candidate_url in iter_remote_x402_candidate_urls(domain, outcomes, agent_facts):
+            timeout_receipt = maybe_abort_for_wall_clock(
+                domain_input,
+                outcomes,
+                artifacts,
+                started_at=started_at,
+                wall_clock_limit=wall_clock_limit,
+                detail="Skipped after per-domain wall-clock limit was reached during remote x402 discovery",
+            )
+            if timeout_receipt is not None:
+                return timeout_receipt
             remote_x402_outcome = build_dynamic_probe_outcome(
                 key="remote_x402",
                 url=candidate_url,
@@ -563,6 +692,16 @@ def probe_domain(domain_input: DomainInput, timeout: float, run_token: str):
     ]
 
     if should_probe_products(homepage_fetch, homepage_outcome, outcomes):
+        timeout_receipt = maybe_abort_for_wall_clock(
+            domain_input,
+            outcomes,
+            artifacts,
+            started_at=started_at,
+            wall_clock_limit=wall_clock_limit,
+            detail="Skipped after per-domain wall-clock limit was reached before product catalog probe",
+        )
+        if timeout_receipt is not None:
+            return timeout_receipt
         fetch = fetch_with_retry(
             f"https://{domain}{PRODUCTS_PROBE.path}",
             timeout=timeout,
@@ -584,6 +723,16 @@ def probe_domain(domain_input: DomainInput, timeout: float, run_token: str):
 
     if outcomes[PRODUCTS_PROBE.key].status != "valid" and api_product_candidate_urls:
         for candidate_url in api_product_candidate_urls:
+            timeout_receipt = maybe_abort_for_wall_clock(
+                domain_input,
+                outcomes,
+                artifacts,
+                started_at=started_at,
+                wall_clock_limit=wall_clock_limit,
+                detail="Skipped after per-domain wall-clock limit was reached during API product discovery",
+            )
+            if timeout_receipt is not None:
+                return timeout_receipt
             if candidate_url == f"https://{domain}{PRODUCTS_PROBE.path}":
                 continue
             api_products_outcome = build_dynamic_probe_outcome(
@@ -604,6 +753,16 @@ def probe_domain(domain_input: DomainInput, timeout: float, run_token: str):
         and current_ucp_outcome
         and current_ucp_outcome.status == "valid"
     ):
+        timeout_receipt = maybe_abort_for_wall_clock(
+            domain_input,
+            outcomes,
+            artifacts,
+            started_at=started_at,
+            wall_clock_limit=wall_clock_limit,
+            detail="Skipped after per-domain wall-clock limit was reached during UCP catalog enrichment",
+        )
+        if timeout_receipt is not None:
+            return timeout_receipt
         ucp_products_outcome = probe_ucp_catalog_products(
             domain=domain,
             homepage_title=homepage_outcome.facts.get("title") if homepage_outcome and isinstance(homepage_outcome.facts.get("title"), str) else None,
@@ -617,6 +776,16 @@ def probe_domain(domain_input: DomainInput, timeout: float, run_token: str):
         outcomes[PRODUCTS_PROBE.key].status == "valid"
         or outcomes.get("api_products", ProbeOutcome("", "", "", None, None)).status == "valid"
     ):
+        timeout_receipt = maybe_abort_for_wall_clock(
+            domain_input,
+            outcomes,
+            artifacts,
+            started_at=started_at,
+            wall_clock_limit=wall_clock_limit,
+            detail="Skipped after per-domain wall-clock limit was reached before cart probe",
+        )
+        if timeout_receipt is not None:
+            return timeout_receipt
         fetch = fetch_with_retry(
             f"https://{domain}{CART_PROBE.path}",
             timeout=timeout,
@@ -646,6 +815,16 @@ def probe_domain(domain_input: DomainInput, timeout: float, run_token: str):
                     fallback_discovery_urls.append(value)
     best_payment_probe_outcome: ProbeOutcome | None = None
     for raw_candidate in iter_payment_probe_candidates(outcomes):
+        timeout_receipt = maybe_abort_for_wall_clock(
+            domain_input,
+            outcomes,
+            artifacts,
+            started_at=started_at,
+            wall_clock_limit=wall_clock_limit,
+            detail="Skipped after per-domain wall-clock limit was reached during payment probe resolution",
+        )
+        if timeout_receipt is not None:
+            return timeout_receipt
         resolved_candidate, resolution_detail = resolve_template_candidate(
             raw_candidate,
             timeout,
@@ -725,4 +904,10 @@ def probe_domain(domain_input: DomainInput, timeout: float, run_token: str):
                 detail=payment_probe_skip_detail,
             )
 
-    return replace(classify_receipt(domain_input, outcomes), artifacts=artifacts)
+    return finalize_receipt(
+        domain_input,
+        outcomes,
+        artifacts,
+        started_at=started_at,
+        wall_clock_limit=wall_clock_limit,
+    )

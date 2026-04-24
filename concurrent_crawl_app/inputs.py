@@ -50,6 +50,18 @@ def parse_args() -> argparse.Namespace:
         help="Persist checkpoint metadata every N completed domains.",
     )
     parser.add_argument(
+        "--stalled-log-every",
+        type=float,
+        default=10.0,
+        help="Log pending in-flight domains every N seconds when no domains are completing. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--domain-wall-clock-limit",
+        type=float,
+        default=30.0,
+        help="Best-effort per-domain wall-clock limit in seconds. Use 0 to disable.",
+    )
+    parser.add_argument(
         "--receipt-shard-max-bytes",
         type=int,
         default=128 * 1024 * 1024,

@@ -6,6 +6,7 @@ import sys
 import time
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -23,20 +24,27 @@ ARTIFACT_FILE_NAMES = {
 }
 
 
+@dataclass(frozen=True)
+class InFlightTask:
+    domain_input: DomainInput
+    submitted_at: float
+
+
 def submit_next(
     executor: ThreadPoolExecutor,
-    futures: dict[Future[CrawlReceipt], DomainInput],
+    futures: dict[Future[CrawlReceipt], InFlightTask],
     domains: Any,
     timeout: float,
     run_token: str,
+    wall_clock_limit: float,
 ) -> bool:
     try:
         domain_input = next(domains)
     except StopIteration:
         return False
 
-    future = executor.submit(probe_domain, domain_input, timeout, run_token)
-    futures[future] = domain_input
+    future = executor.submit(probe_domain, domain_input, timeout, run_token, wall_clock_limit)
+    futures[future] = InFlightTask(domain_input=domain_input, submitted_at=time.monotonic())
     return True
 
 
@@ -196,6 +204,31 @@ def build_checkpoint_payload(
     }
 
 
+def maybe_log_stalled_futures(
+    futures: dict[Future[CrawlReceipt], InFlightTask],
+    *,
+    now: float,
+    last_log_at: float,
+    stalled_log_every: float,
+) -> float:
+    if stalled_log_every <= 0 or not futures:
+        return last_log_at
+
+    oldest_task = min(futures.values(), key=lambda task: task.submitted_at)
+    oldest_age = max(now - oldest_task.submitted_at, 0.0)
+    if last_log_at == 0.0:
+        if oldest_age < stalled_log_every:
+            return last_log_at
+    elif (now - last_log_at) < stalled_log_every:
+        return last_log_at
+
+    print(
+        f"waiting pending={len(futures)} oldest_domain={oldest_task.domain_input.domain} oldest_age={oldest_age:.1f}s",
+        file=sys.stderr,
+    )
+    return now
+
+
 def crawl(args) -> int:
     csv_path = Path(args.csv)
     results_dir = Path(args.results_dir)
@@ -212,6 +245,12 @@ def crawl(args) -> int:
         return 2
     if args.receipt_shard_max_records < 0:
         print("--receipt-shard-max-records must be 0 or greater", file=sys.stderr)
+        return 2
+    if args.stalled_log_every < 0:
+        print("--stalled-log-every must be 0 or greater", file=sys.stderr)
+        return 2
+    if args.domain_wall_clock_limit < 0:
+        print("--domain-wall-clock-limit must be 0 or greater", file=sys.stderr)
         return 2
     if not csv_path.exists():
         print(f"CSV file not found: {csv_path}", file=sys.stderr)
@@ -251,10 +290,11 @@ def crawl(args) -> int:
         domains = iter_limited(domains, args.limit)
 
     started_at = time.monotonic()
-    futures: dict[Future[CrawlReceipt], DomainInput] = {}
+    futures: dict[Future[CrawlReceipt], InFlightTask] = {}
     run_token = hex(int(started_at * 1_000_000))[2:]
     last_completed_row_index = start_row_index
     interrupted = False
+    last_stalled_log_at = 0.0
     receipt_writer = ReceiptShardWriter(
         receipts_dir,
         max_bytes=args.receipt_shard_max_bytes,
@@ -266,13 +306,31 @@ def crawl(args) -> int:
     try:
         with receipt_writer:
             for _ in range(args.concurrency):
-                if not submit_next(executor, futures, domains, args.timeout, run_token):
+                if not submit_next(
+                    executor,
+                    futures,
+                    domains,
+                    args.timeout,
+                    run_token,
+                    args.domain_wall_clock_limit,
+                ):
                     break
 
             while futures:
-                done, _ = wait(futures, return_when=FIRST_COMPLETED)
+                done, _ = wait(futures, timeout=1.0, return_when=FIRST_COMPLETED)
+                if not done:
+                    last_stalled_log_at = maybe_log_stalled_futures(
+                        futures,
+                        now=time.monotonic(),
+                        last_log_at=last_stalled_log_at,
+                        stalled_log_every=args.stalled_log_every,
+                    )
+                    continue
+
+                last_stalled_log_at = 0.0
                 for future in done:
-                    domain_input = futures.pop(future)
+                    task = futures.pop(future)
+                    domain_input = task.domain_input
 
                     try:
                         receipt = future.result()
@@ -344,7 +402,14 @@ def crawl(args) -> int:
                             ),
                         )
 
-                    submit_next(executor, futures, domains, args.timeout, run_token)
+                    submit_next(
+                        executor,
+                        futures,
+                        domains,
+                        args.timeout,
+                        run_token,
+                        args.domain_wall_clock_limit,
+                    )
     except KeyboardInterrupt:
         interrupted = True
         print(
