@@ -45,6 +45,8 @@
 - Added payment-surface enrichment so valid receipts can now capture provider hints and rails such as Shopify, Google Pay, x402, AsterPay, Nevermined, and crypto-oriented clues when they are actually present.
 - Added stale-positive cleanup so recrawling a domain that no longer qualifies removes its old `results/positives/<domain>.json` file instead of leaving misleading residue behind.
 - Improved catalog samples by deduplicating repeated products and attaching likely Shopify product URLs plus cart-derived currency when available.
+- Reworked `/.well-known/commerce` parsing so API-first offers can count as real machine-buyable surfaces without a `products.json` catalog. The crawler now extracts priced sample offers, purchase-intent URLs, live machine-payment path statuses, and provider hints from the commerce document itself.
+- Stopped treating generic OpenAPI `402 Payment Required` responses as `x402`. OpenAPI now records payment-challenge operations and `payment-signature` header support separately, so `x402` is only inferred from explicit x402-specific evidence.
 
 ### Output model now
 

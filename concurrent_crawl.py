@@ -28,12 +28,13 @@ TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 PAYMENT_PROVIDER_MARKERS = {
     "asterpay": ("asterpay", "asterpay.io"),
     "crossmint": ("crossmint",),
+    "dialtoneapp_network": ("dialtoneapp_network", "dialtoneapp network", "dtapp_network_v1"),
     "google_pay": ("com.google.pay", "gpay", "google pay", "pay.google.com"),
     "nevermined": ("nevermined",),
     "paypal": ("paypal",),
     "shopify": ("shopify", "myshopify.com"),
+    "stripe": ("stripe", "stripe-subscription", "stripe machine payments"),
     "skyfire": ("skyfire",),
-    "stripe": ("stripe",),
     "x402": ("x402",),
 }
 
@@ -41,6 +42,7 @@ PAYMENT_RAIL_MARKERS = {
     "card": ("card", "visa", "mastercard", "master", "american_express", "amex", "discover", "diners_club"),
     "digital_wallet": ("com.google.pay", "gpay", "google pay", "pay.google.com", "apple pay"),
     "crypto": ("usdc", "usdt", "bitcoin", "ethereum", "solana", "coinbase", "walletconnect", "nevermined", "asterpay"),
+    "saved_card": ("saved card", "saved-card", "stripe-subscription", "card_network_machine_payments"),
     "x402": ("x402", "payment required"),
 }
 
@@ -491,6 +493,80 @@ def collect_payment_hints(value: Any) -> dict[str, Any]:
     }
 
 
+def normalize_status_value(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    return normalized or None
+
+
+def is_live_status(value: Any) -> bool:
+    return normalize_status_value(value) in {"active", "available", "enabled", "live"}
+
+
+def is_active_offer_status(value: Any) -> bool:
+    normalized = normalize_status_value(value)
+    return normalized in {None, "active", "available", "enabled", "live"}
+
+
+def is_human_checkout_kind(value: Any) -> bool:
+    return normalize_status_value(value) == "human_browser_checkout"
+
+
+def infer_payment_surface_from_hints(provider_hints: list[str], rail_hints: list[str]) -> str | None:
+    rail_set = set(rail_hints)
+    if "x402" in rail_set:
+        return "x402"
+    if "saved_card" in rail_set or "dialtoneapp_network" in provider_hints:
+        return "saved_card_authority"
+    if {"card", "digital_wallet"} & rail_set:
+        return "standard_checkout"
+    if "crypto" in rail_set:
+        return "crypto"
+    if provider_hints:
+        return "provider_named"
+    return None
+
+
+def sample_offer_from_payload(offer: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    offer_id = offer.get("id") or offer.get("offer")
+    title = offer.get("title") or offer.get("name")
+    kind = offer.get("kind") or offer.get("type")
+    status = normalize_status_value(offer.get("status")) or "unknown"
+    price = offer.get("price") if isinstance(offer.get("price"), dict) else {}
+    amount = price.get("amount")
+    currency = price.get("currency")
+    interval = price.get("interval")
+    api = offer.get("api") if isinstance(offer.get("api"), dict) else {}
+    purchase_modes = [
+        str(mode).strip()
+        for mode in (offer.get("purchase_modes") if isinstance(offer.get("purchase_modes"), list) else [])
+        if str(mode).strip()
+    ]
+
+    sample_offer: dict[str, Any] = {
+        "id": offer_id,
+        "title": title,
+        "kind": kind,
+        "status": status,
+    }
+    if isinstance(amount, (int, float, str)) and str(amount).strip():
+        sample_offer["amount"] = str(amount).strip()
+    if isinstance(currency, str) and currency.strip():
+        sample_offer["currency"] = currency.strip().upper()[:8]
+    if isinstance(interval, str) and interval.strip():
+        sample_offer["interval"] = interval.strip().lower()
+    if purchase_modes:
+        sample_offer["purchase_modes"] = purchase_modes[:8]
+    if isinstance(api.get("purchase_intent"), str) and api["purchase_intent"].strip():
+        sample_offer["purchase_intent_url"] = api["purchase_intent"].strip()
+    if isinstance(api.get("offer_lookup"), str) and api["offer_lookup"].strip():
+        sample_offer["offer_lookup_url"] = api["offer_lookup"].strip()
+
+    has_price = "amount" in sample_offer and "currency" in sample_offer
+    return sample_offer, has_price
+
+
 def parse_json_body(fetch: FetchResponse) -> Any:
     if not fetch.body:
         raise ValueError("empty body")
@@ -651,7 +727,137 @@ def validate_commerce(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
             interesting = {"offer", "offers", "price", "pricing", "payment", "purchase", "checkout", "commerce"}
             if not any(key in interesting for key in payload.keys()):
                 return False, "commerce JSON lacked price or purchase-like keys", {"top_level_keys": keys[:12]}
-            return True, "Structured commerce JSON detected", {"top_level_keys": keys[:12]}
+            offers = payload.get("offers") if isinstance(payload.get("offers"), list) else []
+            offer_count = 0
+            active_offer_count = 0
+            priced_offer_count = 0
+            sample_offers: list[dict[str, Any]] = []
+            seen_offer_keys: set[tuple[str | None, str | None]] = set()
+            purchase_intent_urls: list[str] = []
+            offer_lookup_urls: list[str] = []
+
+            for offer in offers:
+                if not isinstance(offer, dict):
+                    continue
+                offer_count += 1
+                if is_active_offer_status(offer.get("status")):
+                    active_offer_count += 1
+                sample_offer, has_price = sample_offer_from_payload(offer)
+                if has_price:
+                    priced_offer_count += 1
+                sample_key = (
+                    sample_offer.get("id") if isinstance(sample_offer.get("id"), str) else None,
+                    sample_offer.get("title") if isinstance(sample_offer.get("title"), str) else None,
+                )
+                if len(sample_offers) < 3 and sample_key not in seen_offer_keys:
+                    sample_offers.append(sample_offer)
+                    seen_offer_keys.add(sample_key)
+                purchase_intent_url = sample_offer.get("purchase_intent_url")
+                if isinstance(purchase_intent_url, str):
+                    purchase_intent_urls = merge_unique_limited(purchase_intent_urls, [purchase_intent_url], limit=8)
+                offer_lookup_url = sample_offer.get("offer_lookup_url")
+                if isinstance(offer_lookup_url, str):
+                    offer_lookup_urls = merge_unique_limited(offer_lookup_urls, [offer_lookup_url], limit=8)
+
+            auth = payload.get("auth") if isinstance(payload.get("auth"), dict) else {}
+            checkout = payload.get("checkout") if isinstance(payload.get("checkout"), dict) else {}
+            purchase_intent_auth = normalize_status_value(auth.get("purchase_intent")) or (
+                auth.get("purchase_intent").strip() if isinstance(auth.get("purchase_intent"), str) else None
+            )
+
+            live_machine_payment_path_ids: list[str] = []
+            live_machine_payment_path_labels: list[str] = []
+            live_machine_payment_path_kinds: list[str] = []
+            live_payment_provider_hints: list[str] = []
+            live_payment_rail_hints: list[str] = []
+            live_payment_endpoint_hosts: list[str] = []
+            live_machine_payment_path_count = 0
+
+            machine_payment_paths = payload.get("machine_payment_paths") if isinstance(payload.get("machine_payment_paths"), list) else []
+            for path in machine_payment_paths:
+                if not isinstance(path, dict) or not is_live_status(path.get("status")):
+                    continue
+                if is_human_checkout_kind(path.get("kind")):
+                    continue
+                live_machine_payment_path_count += 1
+                path_id = path.get("id")
+                path_label = path.get("label")
+                path_kind = path.get("kind")
+                if isinstance(path_id, str) and path_id.strip():
+                    live_machine_payment_path_ids = merge_unique_limited(live_machine_payment_path_ids, [path_id.strip()], limit=12)
+                if isinstance(path_label, str) and path_label.strip():
+                    live_machine_payment_path_labels = merge_unique_limited(live_machine_payment_path_labels, [path_label.strip()], limit=12)
+                if isinstance(path_kind, str) and path_kind.strip():
+                    live_machine_payment_path_kinds = merge_unique_limited(live_machine_payment_path_kinds, [path_kind.strip()], limit=12)
+                payment_hints = collect_payment_hints(path)
+                live_payment_provider_hints = merge_unique_limited(
+                    live_payment_provider_hints,
+                    payment_hints.get("payment_provider_hints", []) if isinstance(payment_hints.get("payment_provider_hints"), list) else [],
+                    limit=12,
+                )
+                live_payment_rail_hints = merge_unique_limited(
+                    live_payment_rail_hints,
+                    payment_hints.get("payment_rail_hints", []) if isinstance(payment_hints.get("payment_rail_hints"), list) else [],
+                    limit=12,
+                )
+                live_payment_endpoint_hosts = merge_unique_limited(
+                    live_payment_endpoint_hosts,
+                    payment_hints.get("payment_endpoint_hosts", []) if isinstance(payment_hints.get("payment_endpoint_hosts"), list) else [],
+                    limit=12,
+                )
+
+            for provider_key in ("dialtoneapp_network", "nevermined", "skyfire", "crossmint", "asterpay"):
+                section = payload.get(provider_key)
+                if not isinstance(section, dict) or not is_live_status(section.get("status")):
+                    continue
+                payment_hints = collect_payment_hints(section)
+                live_payment_provider_hints = merge_unique_limited(
+                    live_payment_provider_hints,
+                    [provider_key] + (
+                        payment_hints.get("payment_provider_hints", [])
+                        if isinstance(payment_hints.get("payment_provider_hints"), list)
+                        else []
+                    ),
+                    limit=12,
+                )
+                live_payment_rail_hints = merge_unique_limited(
+                    live_payment_rail_hints,
+                    payment_hints.get("payment_rail_hints", []) if isinstance(payment_hints.get("payment_rail_hints"), list) else [],
+                    limit=12,
+                )
+                live_payment_endpoint_hosts = merge_unique_limited(
+                    live_payment_endpoint_hosts,
+                    payment_hints.get("payment_endpoint_hosts", []) if isinstance(payment_hints.get("payment_endpoint_hosts"), list) else [],
+                    limit=12,
+                )
+
+            payment_surface = infer_payment_surface_from_hints(live_payment_provider_hints, live_payment_rail_hints)
+            facts = {
+                "top_level_keys": keys[:12],
+                "offer_count": offer_count,
+                "active_offer_count": active_offer_count,
+                "priced_offer_count": priced_offer_count,
+                "sample_offers": sample_offers,
+                "purchase_intent_urls": purchase_intent_urls,
+                "purchase_intent_url_count": len(purchase_intent_urls),
+                "offer_lookup_urls": offer_lookup_urls,
+                "offer_lookup_url_count": len(offer_lookup_urls),
+                "purchase_intent_auth": purchase_intent_auth,
+                "checkout_state": checkout.get("current_state"),
+                "live_machine_payment_path_ids": live_machine_payment_path_ids,
+                "live_machine_payment_path_labels": live_machine_payment_path_labels,
+                "live_machine_payment_path_kinds": live_machine_payment_path_kinds,
+                "live_machine_payment_path_count": live_machine_payment_path_count,
+                "payment_provider_hints": live_payment_provider_hints,
+                "payment_rail_hints": live_payment_rail_hints,
+                "payment_endpoint_hosts": live_payment_endpoint_hosts,
+                "payment_surface": payment_surface,
+                "crypto_only": bool(
+                    "crypto" in live_payment_rail_hints
+                    and not ({"saved_card", "card", "digital_wallet", "x402"} & set(live_payment_rail_hints))
+                ),
+            }
+            return True, "Structured commerce JSON detected", facts
         return True, "Structured commerce list detected", {"item_count": len(payload)}
 
     lower_text = text.lower()
@@ -872,12 +1078,55 @@ def validate_openapi(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
     if isinstance(security_definitions, dict):
         auth_schemes.extend(sorted(str(key) for key in security_definitions.keys()))
 
-    lower_text = decode_body(fetch.body).lower()
+    payment_required_operation_count = 0
+    payment_signature_header_count = 0
+    payment_required_paths: list[str] = []
+    commerce_path_count = 0
+
+    for path_name, path_item in paths.items():
+        if not isinstance(path_item, dict):
+            continue
+        path_like = str(path_name).lower()
+        path_has_commerce_hint = any(token in path_like for token in ("commerce", "checkout", "purchase", "buy", "billing", "subscription"))
+        if path_has_commerce_hint:
+            commerce_path_count += 1
+
+        path_level_parameters = path_item.get("parameters") if isinstance(path_item.get("parameters"), list) else []
+        for method_name in ("get", "post", "put", "patch", "delete", "options", "head"):
+            operation = path_item.get(method_name)
+            if not isinstance(operation, dict):
+                continue
+
+            parameters = list(path_level_parameters)
+            if isinstance(operation.get("parameters"), list):
+                parameters.extend(operation["parameters"])
+
+            for parameter in parameters:
+                if not isinstance(parameter, dict):
+                    continue
+                name = parameter.get("name")
+                location = parameter.get("in")
+                if isinstance(name, str) and isinstance(location, str) and location.lower() == "header" and name.lower() == "payment-signature":
+                    payment_signature_header_count += 1
+                    break
+
+            responses = operation.get("responses") if isinstance(operation.get("responses"), dict) else {}
+            if "402" in responses or 402 in responses:
+                payment_required_operation_count += 1
+                payment_required_paths = merge_unique_limited(
+                    payment_required_paths,
+                    [f"{method_name.upper()} {path_name}"],
+                    limit=6,
+                )
+
     return True, "OpenAPI document detected", {
         "openapi_version": version,
         "path_count": len(paths),
         "auth_schemes": sorted(set(auth_schemes))[:12],
-        "mentions_402": "402" in lower_text or "payment required" in lower_text,
+        "commerce_path_count": commerce_path_count,
+        "payment_required_operation_count": payment_required_operation_count,
+        "payment_required_paths": payment_required_paths,
+        "payment_signature_header_count": payment_signature_header_count,
     }
 
 
@@ -1280,6 +1529,7 @@ def classify_receipt(
     payment_endpoint_hosts: list[str] = []
     payment_surface: str | None = None
     crypto_only = False
+    commerce_docs_claim_machine_payable = False
 
     if "llms_txt" in valid_keys or "llms_full_txt" in valid_keys:
         tags.append("ai_readable")
@@ -1287,8 +1537,6 @@ def classify_receipt(
         tags.append("catalog_surface")
     if {"openapi_json", "well_known_commerce", "well_known_agent_json", "well_known_agents_json", "root_agent_json"} & valid_keys:
         tags.append("callable_surface")
-    if {"x402_json", "x402_well_known"} & valid_keys:
-        tags.append("machine_payable")
     if {"robots_txt", "sitemap_xml"} <= valid_keys:
         tags.append("crawl_basics")
 
@@ -1321,11 +1569,81 @@ def classify_receipt(
 
     openapi = outcomes.get("openapi_json")
     if openapi and openapi.status == "valid":
-        for key in ("path_count", "auth_schemes", "mentions_402"):
+        for key in (
+            "path_count",
+            "auth_schemes",
+            "commerce_path_count",
+            "payment_required_operation_count",
+            "payment_required_paths",
+            "payment_signature_header_count",
+        ):
             if key in openapi.facts:
                 aggregates[f"openapi_{key}"] = openapi.facts[key]
-        if openapi.facts.get("mentions_402"):
-            payment_rail_hints = merge_unique_limited(payment_rail_hints, ["x402"], limit=12)
+
+    commerce = outcomes.get("well_known_commerce")
+    if commerce and commerce.status == "valid":
+        for key in (
+            "offer_count",
+            "active_offer_count",
+            "priced_offer_count",
+            "sample_offers",
+            "purchase_intent_urls",
+            "purchase_intent_url_count",
+            "offer_lookup_urls",
+            "offer_lookup_url_count",
+            "purchase_intent_auth",
+            "checkout_state",
+            "live_machine_payment_path_ids",
+            "live_machine_payment_path_labels",
+            "live_machine_payment_path_kinds",
+            "live_machine_payment_path_count",
+            "payment_provider_hints",
+            "payment_rail_hints",
+            "payment_endpoint_hosts",
+            "payment_surface",
+            "crypto_only",
+        ):
+            if key in commerce.facts:
+                aggregates[f"commerce_{key}"] = commerce.facts[key]
+        if "sample_offers" in commerce.facts:
+            aggregates["sample_offers"] = commerce.facts["sample_offers"]
+        if int(commerce.facts.get("priced_offer_count") or 0) > 0:
+            tags.append("offer_surface")
+        payment_provider_hints = merge_unique_limited(
+            payment_provider_hints,
+            commerce.facts.get("payment_provider_hints", []) if isinstance(commerce.facts.get("payment_provider_hints"), list) else [],
+            limit=12,
+        )
+        payment_rail_hints = merge_unique_limited(
+            payment_rail_hints,
+            commerce.facts.get("payment_rail_hints", []) if isinstance(commerce.facts.get("payment_rail_hints"), list) else [],
+            limit=12,
+        )
+        payment_endpoint_hosts = merge_unique_limited(
+            payment_endpoint_hosts,
+            commerce.facts.get("payment_endpoint_hosts", []) if isinstance(commerce.facts.get("payment_endpoint_hosts"), list) else [],
+            limit=12,
+        )
+        if not payment_surface and isinstance(commerce.facts.get("payment_surface"), str):
+            payment_surface = commerce.facts["payment_surface"]
+        if bool(commerce.facts.get("crypto_only")):
+            crypto_only = True
+
+        priced_offer_count = int(commerce.facts.get("priced_offer_count") or 0)
+        purchase_intent_url_count = int(commerce.facts.get("purchase_intent_url_count") or 0)
+        live_machine_payment_path_count = int(commerce.facts.get("live_machine_payment_path_count") or 0)
+        payment_required_operation_count = int(openapi.facts.get("payment_required_operation_count") or 0) if openapi and openapi.status == "valid" else 0
+        payment_signature_header_count = int(openapi.facts.get("payment_signature_header_count") or 0) if openapi and openapi.status == "valid" else 0
+        purchase_intent_auth = normalize_status_value(commerce.facts.get("purchase_intent_auth"))
+        has_machine_payment_contract = (
+            live_machine_payment_path_count > 0
+            or bool(commerce.facts.get("payment_surface"))
+            or bool(commerce.facts.get("payment_provider_hints"))
+            or purchase_intent_auth not in {None, "", "none"}
+        )
+        has_payment_challenge_api = payment_required_operation_count > 0 or payment_signature_header_count > 0 or purchase_intent_auth not in {None, "", "none"}
+        if priced_offer_count > 0 and purchase_intent_url_count > 0 and has_machine_payment_contract and has_payment_challenge_api:
+            commerce_docs_claim_machine_payable = True
 
     ucp = outcomes.get("well_known_ucp")
     if ucp and ucp.status == "valid":
@@ -1371,6 +1689,10 @@ def classify_receipt(
         payment_provider_hints = merge_unique_limited(payment_provider_hints, ["x402"], limit=12)
         payment_rail_hints = merge_unique_limited(payment_rail_hints, ["x402"], limit=12)
         payment_surface = "x402"
+        tags.append("machine_payable")
+
+    if commerce_docs_claim_machine_payable:
+        tags.append("machine_payable")
 
     if payment_provider_hints:
         aggregates["payment_provider_hints"] = payment_provider_hints
