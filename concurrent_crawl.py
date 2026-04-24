@@ -25,6 +25,25 @@ USER_AGENT = "dialtoneapp.com crawler v0.2.0 https://dialtoneapp.com/contact hum
 DEFAULT_ACCEPT = "text/html, application/json, text/plain, application/xml, text/xml, */*;q=0.1"
 TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 
+PAYMENT_PROVIDER_MARKERS = {
+    "asterpay": ("asterpay", "asterpay.io"),
+    "crossmint": ("crossmint",),
+    "google_pay": ("com.google.pay", "gpay", "google pay", "pay.google.com"),
+    "nevermined": ("nevermined",),
+    "paypal": ("paypal",),
+    "shopify": ("shopify", "myshopify.com"),
+    "skyfire": ("skyfire",),
+    "stripe": ("stripe",),
+    "x402": ("x402",),
+}
+
+PAYMENT_RAIL_MARKERS = {
+    "card": ("card", "visa", "mastercard", "master", "american_express", "amex", "discover", "diners_club"),
+    "digital_wallet": ("com.google.pay", "gpay", "google pay", "pay.google.com", "apple pay"),
+    "crypto": ("usdc", "usdt", "bitcoin", "ethereum", "solana", "coinbase", "walletconnect", "nevermined", "asterpay"),
+    "x402": ("x402", "payment required"),
+}
+
 TEXTUAL_CONTENT_TYPES = {
     "application/ecmascript",
     "application/javascript",
@@ -155,6 +174,7 @@ BASE_PROBES = (
 )
 
 PRODUCTS_PROBE = ProbeSpec("products_json", "/products.json", "products", max_bytes=524_288, control_group="catalog")
+CART_PROBE = ProbeSpec("cart_json", "/cart.js", "cart", max_bytes=16_384, control_group="catalog")
 
 
 def parse_args() -> argparse.Namespace:
@@ -377,6 +397,100 @@ def parse_price(value: Any) -> float | None:
         return None
 
 
+def has_placeholder_value(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    lower_value = value.lower()
+    placeholders = (
+        "your_",
+        "example.com",
+        "merchant.com",
+        "shop name",
+        "12345678901234567890",
+        "your-forter",
+        "your_forter",
+        "sandbox.checkouttools.com",
+    )
+    return any(marker in lower_value for marker in placeholders)
+
+
+def flatten_strings(value: Any) -> list[str]:
+    results: list[str] = []
+    if isinstance(value, str):
+        results.append(value)
+        return results
+    if isinstance(value, dict):
+        for item in value.values():
+            results.extend(flatten_strings(item))
+        return results
+    if isinstance(value, list):
+        for item in value:
+            results.extend(flatten_strings(item))
+    return results
+
+
+def merge_unique_limited(existing: list[str], values: list[str], *, limit: int) -> list[str]:
+    if limit <= 0:
+        return []
+    merged = list(existing)
+    if len(merged) >= limit:
+        return merged[:limit]
+    seen = {value for value in merged if isinstance(value, str)}
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        cleaned = value.strip()
+        if not cleaned or cleaned in seen:
+            continue
+        merged.append(cleaned)
+        seen.add(cleaned)
+        if len(merged) >= limit:
+            break
+    return merged
+
+
+def collect_payment_hints(value: Any) -> dict[str, Any]:
+    strings = [item.strip() for item in flatten_strings(value) if isinstance(item, str)]
+    lower_strings = [item.lower() for item in strings if item]
+
+    provider_hints: list[str] = []
+    rail_hints: list[str] = []
+    endpoint_hosts: list[str] = []
+
+    for provider, markers in PAYMENT_PROVIDER_MARKERS.items():
+        if any(any(marker in item for marker in markers) for item in lower_strings):
+            provider_hints.append(provider)
+
+    for rail, markers in PAYMENT_RAIL_MARKERS.items():
+        if any(any(marker in item for marker in markers) for item in lower_strings):
+            rail_hints.append(rail)
+
+    for item in strings:
+        if not (item.startswith("http://") or item.startswith("https://")):
+            continue
+        host = final_host(item)
+        if host:
+            endpoint_hosts.append(host)
+
+    payment_surface = None
+    if "x402" in rail_hints:
+        payment_surface = "x402"
+    elif {"card", "digital_wallet"} & set(rail_hints):
+        payment_surface = "standard_checkout"
+    elif "crypto" in rail_hints:
+        payment_surface = "crypto"
+    elif provider_hints:
+        payment_surface = "provider_named"
+
+    return {
+        "payment_provider_hints": sorted(set(provider_hints))[:12],
+        "payment_rail_hints": sorted(set(rail_hints))[:12],
+        "payment_endpoint_hosts": sorted(set(endpoint_hosts))[:12],
+        "payment_surface": payment_surface,
+        "crypto_only": bool("crypto" in rail_hints and not ({"card", "digital_wallet", "x402"} & set(rail_hints))),
+    }
+
+
 def parse_json_body(fetch: FetchResponse) -> Any:
     if not fetch.body:
         raise ValueError("empty body")
@@ -567,16 +681,101 @@ def validate_ucp(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
     if not isinstance(ucp, dict):
         return False, "UCP payload missing top-level ucp object", {}
 
-    capabilities = ucp.get("capabilities") if isinstance(ucp.get("capabilities"), dict) else {}
+    raw_capabilities = ucp.get("capabilities")
+    capability_count = 0
+    capability_names: list[str] = []
+    if isinstance(raw_capabilities, dict):
+        capability_names = sorted(str(key) for key in raw_capabilities.keys())
+        capability_count = len(capability_names)
+    elif isinstance(raw_capabilities, list):
+        capability_names = [
+            str(item.get("name"))
+            for item in raw_capabilities
+            if isinstance(item, dict) and item.get("name")
+        ]
+        capability_count = len(capability_names)
+
     services = ucp.get("services") if isinstance(ucp.get("services"), dict) else {}
     version = ucp.get("version")
-    if not version and not capabilities and not services:
+    supported_versions = ucp.get("supported_versions") if isinstance(ucp.get("supported_versions"), dict) else {}
+    current_version_url = None
+    if version:
+        current_version_candidate = supported_versions.get(version)
+        if isinstance(current_version_candidate, str) and current_version_candidate:
+            current_version_url = current_version_candidate
+    if not version and capability_count == 0 and not services:
         return False, "UCP payload lacked version, capabilities, and services", {}
+
+    handler_names: list[str] = []
+    handler_ids: list[str] = []
+    payment_endpoints: list[str] = []
+    contains_placeholder = False
+
+    payment = payload.get("payment") if isinstance(payload.get("payment"), dict) else {}
+    handlers = payment.get("handlers") if isinstance(payment.get("handlers"), list) else []
+
+    for handler in handlers:
+        if not isinstance(handler, dict):
+            continue
+        handler_id = handler.get("id")
+        handler_name = handler.get("name")
+        if isinstance(handler_id, str) and handler_id:
+            handler_ids.append(handler_id)
+        if isinstance(handler_name, str) and handler_name:
+            handler_names.append(handler_name)
+        for value in flatten_strings(handler):
+            if has_placeholder_value(value):
+                contains_placeholder = True
+            if value.startswith("http://") or value.startswith("https://"):
+                payment_endpoints.append(value)
+
+    ucp_payment_handlers = ucp.get("payment_handlers")
+    if isinstance(ucp_payment_handlers, dict):
+        for handler_name, entries in ucp_payment_handlers.items():
+            if isinstance(handler_name, str) and handler_name:
+                handler_names.append(handler_name)
+            if isinstance(entries, dict):
+                entries = [entries]
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                handler_id = entry.get("id")
+                if isinstance(handler_id, str) and handler_id:
+                    handler_ids.append(handler_id)
+                for value in flatten_strings(entry):
+                    if has_placeholder_value(value):
+                        contains_placeholder = True
+                    if value.startswith("http://") or value.startswith("https://"):
+                        payment_endpoints.append(value)
+
+    all_strings = flatten_strings(payload)
+    if any(has_placeholder_value(value) for value in all_strings):
+        contains_placeholder = True
+
+    if contains_placeholder:
+        return False, "UCP payload looked like a template or sandbox example", {
+            "ucp_version": version,
+            "capability_count": capability_count,
+            "service_count": len(services),
+            "payment_handler_count": len(handler_names),
+            "payment_handler_names": sorted(set(handler_names))[:12],
+        }
+
+    payment_hints = collect_payment_hints(payload)
 
     return True, "Valid UCP document detected", {
         "ucp_version": version,
-        "capability_count": len(capabilities),
+        "capability_count": capability_count,
+        "capability_names": capability_names[:12],
         "service_count": len(services),
+        "payment_handler_count": len(handler_names),
+        "payment_handler_names": sorted(set(handler_names))[:12],
+        "payment_handler_ids": sorted(set(handler_ids))[:12],
+        "payment_endpoint_samples": sorted(set(payment_endpoints))[:6],
+        "current_version_url": current_version_url,
+        **payment_hints,
     }
 
 
@@ -749,23 +948,45 @@ def validate_products(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
     min_price: float | None = None
     max_price: float | None = None
     sample_titles: list[str] = []
+    sample_products: list[dict[str, Any]] = []
+    seen_samples: set[tuple[str | None, str | None]] = set()
 
     for product in products:
         if not isinstance(product, dict):
             continue
         product_count += 1
         title = product.get("title")
-        if isinstance(title, str) and title and len(sample_titles) < 3:
-            sample_titles.append(title[:120])
+        if isinstance(title, str) and title:
+            sample_titles = merge_unique_limited(sample_titles, [title[:120]], limit=3)
 
         variants = product.get("variants")
+        product_min_price: float | None = None
+        product_max_price: float | None = None
+        available_variant_count = 0
+        requires_shipping = False
+        sample_key = (
+            product.get("handle") if isinstance(product.get("handle"), str) else None,
+            title if isinstance(title, str) else None,
+        )
         if not isinstance(variants, list):
+            if len(sample_products) < 3 and sample_key not in seen_samples:
+                sample_products.append({
+                    "title": title,
+                    "handle": product.get("handle"),
+                    "product_type": product.get("product_type"),
+                    "vendor": product.get("vendor"),
+                })
+                seen_samples.add(sample_key)
             continue
 
         for variant in variants:
             if not isinstance(variant, dict):
                 continue
             variant_count += 1
+            if variant.get("available") is True:
+                available_variant_count += 1
+            if variant.get("requires_shipping") is True:
+                requires_shipping = True
             price = parse_price(variant.get("price"))
             currency = variant.get("currency") or product.get("currency")
             if isinstance(currency, str) and currency:
@@ -775,6 +996,22 @@ def validate_products(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
             priced_variant_count += 1
             min_price = price if min_price is None else min(min_price, price)
             max_price = price if max_price is None else max(max_price, price)
+            product_min_price = price if product_min_price is None else min(product_min_price, price)
+            product_max_price = price if product_max_price is None else max(product_max_price, price)
+
+        if len(sample_products) < 3 and sample_key not in seen_samples:
+            sample_products.append({
+                "title": title,
+                "handle": product.get("handle"),
+                "product_type": product.get("product_type"),
+                "vendor": product.get("vendor"),
+                "min_price": product_min_price,
+                "max_price": product_max_price,
+                "available_variant_count": available_variant_count,
+                "variant_count": len(variants),
+                "requires_shipping": requires_shipping,
+            })
+            seen_samples.add(sample_key)
 
     if product_count == 0:
         return False, "products list did not contain product objects", {}
@@ -787,7 +1024,37 @@ def validate_products(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
         "min_price": min_price,
         "max_price": max_price,
         "sample_titles": sample_titles,
+        "sample_products": sample_products,
     }
+
+
+def validate_cart(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
+    if fetch.truncated:
+        return False, f"cart response truncated at {fetch.byte_count} bytes", {"truncated": True}
+
+    try:
+        payload = parse_json_body(fetch)
+    except ValueError as error:
+        return False, str(error), {}
+    except json.JSONDecodeError as error:
+        return False, f"invalid json: {error.msg}", {}
+
+    if not isinstance(payload, dict):
+        return False, "cart payload was not an object", {}
+
+    currency = payload.get("currency")
+    token = payload.get("token")
+    if not isinstance(currency, str) or not currency:
+        return False, "cart payload missing currency", {}
+
+    facts = {
+        "currency": currency,
+        "item_count": payload.get("item_count"),
+        "requires_shipping": payload.get("requires_shipping"),
+    }
+    if isinstance(token, str) and token:
+        facts["has_token"] = True
+    return True, "Public cart JSON detected", facts
 
 
 VALIDATORS = {
@@ -802,7 +1069,37 @@ VALIDATORS = {
     "openapi": validate_openapi,
     "x402": validate_x402,
     "products": validate_products,
+    "cart": validate_cart,
 }
+
+
+def merge_ucp_facts(primary: dict[str, Any], enriched: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(primary)
+    for key, value in enriched.items():
+        if key not in merged:
+            merged[key] = value
+            continue
+        if key in {"payment_handler_count", "service_count", "capability_count"}:
+            primary_value = merged.get(key)
+            if (not primary_value and value) or (isinstance(primary_value, int) and isinstance(value, int) and value > primary_value):
+                merged[key] = value
+            continue
+        if key in {
+            "payment_handler_names",
+            "payment_handler_ids",
+            "payment_endpoint_samples",
+            "capability_names",
+            "payment_provider_hints",
+            "payment_rail_hints",
+            "payment_endpoint_hosts",
+        }:
+            primary_list = merged.get(key) if isinstance(merged.get(key), list) else []
+            new_list = value if isinstance(value, list) else []
+            merged[key] = sorted(dict.fromkeys(primary_list + new_list))[:12]
+            continue
+        if not merged.get(key) and value:
+            merged[key] = value
+    return merged
 
 
 def build_outcome(
@@ -978,6 +1275,11 @@ def classify_receipt(
             tags.append("shopify_hint")
 
     valid_keys = {key for key, outcome in outcomes.items() if outcome.status == "valid"}
+    payment_provider_hints: list[str] = []
+    payment_rail_hints: list[str] = []
+    payment_endpoint_hosts: list[str] = []
+    payment_surface: str | None = None
+    crypto_only = False
 
     if "llms_txt" in valid_keys or "llms_full_txt" in valid_keys:
         tags.append("ai_readable")
@@ -995,19 +1297,91 @@ def classify_receipt(
         for key in ("product_count", "variant_count", "priced_variant_count", "currency_count", "min_price", "max_price", "sample_titles"):
             if key in products.facts:
                 aggregates[key] = products.facts[key]
+        if "sample_products" in products.facts:
+            sample_products: list[dict[str, Any]] = []
+            for item in products.facts["sample_products"]:
+                if not isinstance(item, dict):
+                    continue
+                sample_item = dict(item)
+                handle = sample_item.get("handle")
+                if isinstance(handle, str) and handle:
+                    sample_item["product_url"] = f"https://{domain_input.domain}/products/{handle}"
+                sample_products.append(sample_item)
+            aggregates["sample_products"] = sample_products
+
+    cart = outcomes.get("cart_json")
+    if cart and cart.status == "valid":
+        for key in ("currency", "item_count", "requires_shipping", "has_token"):
+            if key in cart.facts:
+                aggregates[f"cart_{key}"] = cart.facts[key]
+        if aggregates.get("sample_products") and isinstance(cart.facts.get("currency"), str):
+            for item in aggregates["sample_products"]:
+                if isinstance(item, dict) and item.get("min_price") is not None and "currency" not in item:
+                    item["currency"] = cart.facts["currency"]
 
     openapi = outcomes.get("openapi_json")
     if openapi and openapi.status == "valid":
         for key in ("path_count", "auth_schemes", "mentions_402"):
             if key in openapi.facts:
                 aggregates[f"openapi_{key}"] = openapi.facts[key]
+        if openapi.facts.get("mentions_402"):
+            payment_rail_hints = merge_unique_limited(payment_rail_hints, ["x402"], limit=12)
 
     ucp = outcomes.get("well_known_ucp")
     if ucp and ucp.status == "valid":
-        for key in ("ucp_version", "capability_count", "service_count"):
+        for key in (
+            "ucp_version",
+            "capability_count",
+            "capability_names",
+            "service_count",
+            "payment_handler_count",
+            "payment_handler_names",
+            "payment_handler_ids",
+            "payment_endpoint_samples",
+            "payment_provider_hints",
+            "payment_rail_hints",
+            "payment_endpoint_hosts",
+            "payment_surface",
+            "crypto_only",
+        ):
             if key in ucp.facts:
                 aggregate_key = key if key == "ucp_version" else f"ucp_{key}"
                 aggregates[aggregate_key] = ucp.facts[key]
+        payment_provider_hints = merge_unique_limited(
+            payment_provider_hints,
+            ucp.facts.get("payment_provider_hints", []) if isinstance(ucp.facts.get("payment_provider_hints"), list) else [],
+            limit=12,
+        )
+        payment_rail_hints = merge_unique_limited(
+            payment_rail_hints,
+            ucp.facts.get("payment_rail_hints", []) if isinstance(ucp.facts.get("payment_rail_hints"), list) else [],
+            limit=12,
+        )
+        payment_endpoint_hosts = merge_unique_limited(
+            payment_endpoint_hosts,
+            ucp.facts.get("payment_endpoint_hosts", []) if isinstance(ucp.facts.get("payment_endpoint_hosts"), list) else [],
+            limit=12,
+        )
+        if not payment_surface and isinstance(ucp.facts.get("payment_surface"), str):
+            payment_surface = ucp.facts["payment_surface"]
+        if bool(ucp.facts.get("crypto_only")):
+            crypto_only = True
+
+    if {"x402_json", "x402_well_known"} & valid_keys:
+        payment_provider_hints = merge_unique_limited(payment_provider_hints, ["x402"], limit=12)
+        payment_rail_hints = merge_unique_limited(payment_rail_hints, ["x402"], limit=12)
+        payment_surface = "x402"
+
+    if payment_provider_hints:
+        aggregates["payment_provider_hints"] = payment_provider_hints
+    if payment_rail_hints:
+        aggregates["payment_rail_hints"] = payment_rail_hints
+    if payment_endpoint_hosts:
+        aggregates["payment_endpoint_hosts"] = payment_endpoint_hosts
+    if payment_surface:
+        aggregates["payment_surface"] = payment_surface
+    if payment_surface or payment_provider_hints or payment_rail_hints:
+        aggregates["crypto_only"] = crypto_only
 
     if "machine_payable" in tags:
         label = "machine_payable"
@@ -1075,6 +1449,26 @@ def probe_domain(domain_input: DomainInput, timeout: float, run_token: str) -> C
             control = build_control_fetch(domain, spec.control_group, run_token, timeout, control_cache)
         outcomes[spec.key] = build_outcome(spec, fetch, control)
 
+    root_ucp_outcome = outcomes.get("well_known_ucp")
+    if root_ucp_outcome and root_ucp_outcome.status == "valid":
+        current_version_url = root_ucp_outcome.facts.get("current_version_url")
+        if isinstance(current_version_url, str) and current_version_url and current_version_url != root_ucp_outcome.final_url:
+            versioned_fetch = fetch_url(current_version_url, timeout=timeout, max_bytes=BASE_PROBES[6].max_bytes)
+            versioned_valid, _, versioned_facts = validate_ucp(versioned_fetch)
+            if versioned_valid:
+                outcomes["well_known_ucp"] = ProbeOutcome(
+                    key=root_ucp_outcome.key,
+                    path=root_ucp_outcome.path,
+                    status=root_ucp_outcome.status,
+                    http_status=root_ucp_outcome.http_status,
+                    content_type=root_ucp_outcome.content_type,
+                    final_url=root_ucp_outcome.final_url,
+                    byte_count=root_ucp_outcome.byte_count,
+                    body_sha256=root_ucp_outcome.body_sha256,
+                    detail=f"{root_ucp_outcome.detail}; enriched from versioned UCP document",
+                    facts=merge_ucp_facts(root_ucp_outcome.facts, versioned_facts),
+                )
+
     if should_probe_products(homepage_fetch, homepage_outcome, outcomes):
         fetch = fetch_url(f"https://{domain}{PRODUCTS_PROBE.path}", timeout=timeout, max_bytes=PRODUCTS_PROBE.max_bytes)
         control = None
@@ -1089,6 +1483,22 @@ def probe_domain(domain_input: DomainInput, timeout: float, run_token: str) -> C
             http_status=None,
             content_type=None,
             detail="Skipped because homepage/UCP did not suggest a product catalog",
+        )
+
+    if outcomes[PRODUCTS_PROBE.key].status == "valid":
+        fetch = fetch_url(f"https://{domain}{CART_PROBE.path}", timeout=timeout, max_bytes=CART_PROBE.max_bytes)
+        control = None
+        if CART_PROBE.control_group and fetch.status == 200:
+            control = build_control_fetch(domain, CART_PROBE.control_group, run_token, timeout, control_cache)
+        outcomes[CART_PROBE.key] = build_outcome(CART_PROBE, fetch, control)
+    else:
+        outcomes[CART_PROBE.key] = ProbeOutcome(
+            key=CART_PROBE.key,
+            path=CART_PROBE.path,
+            status="skipped",
+            http_status=None,
+            content_type=None,
+            detail="Skipped because no valid public catalog was detected",
         )
 
     return classify_receipt(domain_input, outcomes)
@@ -1340,6 +1750,7 @@ def crawl(args: argparse.Namespace) -> int:
 
                     serialized = serialize_receipt(receipt)
                     receipt_writer.write_line(json.dumps(serialized, separators=(",", ":"), sort_keys=True))
+                    positive_path = positives_dir / f"{receipt.domain}.json"
 
                     if has_interesting_signal(receipt):
                         found += 1
@@ -1347,12 +1758,16 @@ def crawl(args: argparse.Namespace) -> int:
                             key for key in INTERESTING_PROBE_KEYS
                             if receipt.probes.get(key) and receipt.probes[key].status == "valid"
                         )
-                        positive_path = positives_dir / f"{receipt.domain}.json"
                         positive_path.write_text(
                             json.dumps(serialized, indent=2, sort_keys=True),
                             encoding="utf-8",
                         )
                         print(f"FOUND {receipt.domain} {receipt.label} {','.join(interesting_keys)}")
+                    elif positive_path.exists():
+                        try:
+                            positive_path.unlink()
+                        except OSError:
+                            pass
 
                     if args.progress_every and completed % args.progress_every == 0:
                         elapsed = max(time.monotonic() - started_at, 0.001)

@@ -36,8 +36,15 @@
 - Added `KeyboardInterrupt` handling so `Ctrl-C` writes a checkpoint immediately instead of only at the next periodic checkpoint boundary.
 - Added login-wall detection so cross-host redirects into auth/SSO hosts are marked as `gated` instead of becoming positives.
 - Tightened `llms`, `commerce`, and `x402` validation so HTML/script handoff pages do not count as valid machine-readable documents.
+- Tightened UCP validation so placeholder/template payloads with values like `www.merchant.com` or `YOUR_FORTER_UCP_API_KEY` do not count as real merchant positives.
+- Enriched valid catalog receipts with sample product details and valid UCP receipts with payment-handler details when available.
+- Added follow-up enrichment for valid UCP roots by reading the versioned UCP document when it exposes richer payment-handler metadata.
+- Added a lightweight public cart probe (`/cart.js`) for valid catalog sites so receipts can record cart currency and related basics.
 - Increased byte caps for `openapi.json` and `products.json` so large but real documents are less likely to be misclassified as invalid.
 - Reworked checkpoint progress tracking so the next row index is tracked explicitly instead of depending on the last loop variable.
+- Added payment-surface enrichment so valid receipts can now capture provider hints and rails such as Shopify, Google Pay, x402, AsterPay, Nevermined, and crypto-oriented clues when they are actually present.
+- Added stale-positive cleanup so recrawling a domain that no longer qualifies removes its old `results/positives/<domain>.json` file instead of leaving misleading residue behind.
+- Improved catalog samples by deduplicating repeated products and attaching likely Shopify product URLs plus cart-derived currency when available.
 
 ### Output model now
 
