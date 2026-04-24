@@ -30,6 +30,71 @@ class InFlightTask:
     submitted_at: float
 
 
+def build_source_csv_metadata(csv_path: Path) -> dict[str, Any]:
+    resolved_path = csv_path.resolve()
+    return {
+        "path": str(resolved_path),
+        "name": resolved_path.name,
+    }
+
+
+def infer_legacy_checkpoint_source_csv(csv_path: Path) -> dict[str, Any] | None:
+    if csv_path.name == "top-1m.csv":
+        return build_source_csv_metadata(csv_path)
+
+    candidate = (csv_path.parent / "top-1m.csv").resolve()
+    if candidate.exists():
+        return {
+            "path": str(candidate),
+            "name": candidate.name,
+        }
+    return None
+
+
+def build_source_progress(
+    checkpoint: dict[str, Any] | None,
+    *,
+    current_source_csv: dict[str, Any],
+    legacy_source_csv: dict[str, Any] | None = None,
+) -> dict[str, dict[str, Any]]:
+    progress: dict[str, dict[str, Any]] = {}
+    if not checkpoint:
+        return progress
+
+    raw_progress = checkpoint.get("source_progress")
+    if isinstance(raw_progress, dict):
+        for key, value in raw_progress.items():
+            if not isinstance(key, str) or not isinstance(value, dict):
+                continue
+            progress[key] = dict(value)
+
+    checkpoint_source_csv = checkpoint.get("source_csv")
+    next_row_index = max(0, int(checkpoint.get("next_row_index", 0)))
+    if isinstance(checkpoint_source_csv, dict):
+        checkpoint_source_path = checkpoint_source_csv.get("path")
+        if isinstance(checkpoint_source_path, str) and checkpoint_source_path:
+            progress.setdefault(
+                checkpoint_source_path,
+                {
+                    "csv_name": checkpoint_source_csv.get("name") or Path(checkpoint_source_path).name,
+                    "next_row_index": next_row_index,
+                    "updated_at": checkpoint.get("updated_at"),
+                },
+            )
+    elif checkpoint:
+        inferred_source_csv = legacy_source_csv or current_source_csv
+        progress.setdefault(
+            inferred_source_csv["path"],
+            {
+                "csv_name": inferred_source_csv.get("name"),
+                "next_row_index": next_row_index,
+                "updated_at": checkpoint.get("updated_at"),
+            },
+        )
+
+    return progress
+
+
 def submit_next(
     executor: ThreadPoolExecutor,
     futures: dict[Future[CrawlReceipt], InFlightTask],
@@ -201,16 +266,25 @@ def build_checkpoint_payload(
     label_counts: Counter[str],
     probe_status_counts: Counter[str],
     receipt_shard: dict[str, int],
+    source_csv: dict[str, Any],
+    source_progress: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
+    updated_at = datetime.now(timezone.utc).isoformat()
     return {
         "completed": completed,
         "found": found,
         "next_row_index": next_row_index,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": updated_at,
         "elapsed_seconds": round(max(time.monotonic() - started_at, 0.0), 3),
         "label_counts": dict(sorted(label_counts.items())),
         "probe_status_counts": dict(sorted(probe_status_counts.items())),
         "receipt_shard": receipt_shard,
+        "source_csv": source_csv,
+        "source_progress": {
+            key: dict(value)
+            for key, value in sorted(source_progress.items())
+            if isinstance(key, str) and isinstance(value, dict)
+        },
     }
 
 
@@ -241,6 +315,8 @@ def maybe_log_stalled_futures(
 
 def crawl(args) -> int:
     csv_path = Path(args.csv)
+    source_csv = build_source_csv_metadata(csv_path)
+    legacy_source_csv = infer_legacy_checkpoint_source_csv(csv_path)
     results_dir = Path(args.results_dir)
     receipts_dir = results_dir / "receipts"
     positives_dir = results_dir / "positives"
@@ -278,7 +354,13 @@ def crawl(args) -> int:
     evidence_dir.mkdir(parents=True, exist_ok=True)
 
     checkpoint = None if args.no_resume else load_checkpoint(checkpoint_path)
-    start_row_index = int(checkpoint.get("next_row_index", 0)) if checkpoint else 0
+    source_progress = build_source_progress(
+        checkpoint,
+        current_source_csv=source_csv,
+        legacy_source_csv=legacy_source_csv,
+    )
+    current_source_progress = source_progress.get(source_csv["path"], {}) if checkpoint else {}
+    start_row_index = int(current_source_progress.get("next_row_index", 0)) if current_source_progress else 0
     completed = int(checkpoint.get("completed", 0)) if checkpoint else 0
     found = int(checkpoint.get("found", 0)) if checkpoint else 0
     label_counts: Counter[str] = Counter(checkpoint.get("label_counts", {})) if checkpoint else Counter()
@@ -291,10 +373,16 @@ def crawl(args) -> int:
     )
 
     if checkpoint and not args.no_resume:
-        print(
-            f"resuming from row_index={start_row_index} completed={completed} found={found} shard=receipt-{receipt_shard_state.shard_index:06d}",
-            file=sys.stderr,
-        )
+        if current_source_progress:
+            print(
+                f"resuming from row_index={start_row_index} completed={completed} found={found} shard=receipt-{receipt_shard_state.shard_index:06d}",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"checkpoint exists for a different CSV; starting fresh at row_index=0 for {source_csv['name']} while appending to shard=receipt-{receipt_shard_state.shard_index:06d}",
+                file=sys.stderr,
+            )
     elif args.no_resume and any(receipts_dir.glob("receipt-*.ndjson")):
         print(
             f"--no-resume requested; appending fresh rows into {receipts_dir}",
@@ -406,6 +494,11 @@ def crawl(args) -> int:
                         )
 
                     if args.checkpoint_every and completed % args.checkpoint_every == 0:
+                        source_progress[source_csv["path"]] = {
+                            "csv_name": source_csv["name"],
+                            "next_row_index": last_completed_row_index,
+                            "updated_at": datetime.now(timezone.utc).isoformat(),
+                        }
                         receipt_writer.flush()
                         write_checkpoint(
                             checkpoint_path,
@@ -417,6 +510,8 @@ def crawl(args) -> int:
                                 label_counts=label_counts,
                                 probe_status_counts=probe_status_counts,
                                 receipt_shard=receipt_writer.snapshot(),
+                                source_csv=source_csv,
+                                source_progress=source_progress,
                             ),
                         )
 
@@ -440,6 +535,11 @@ def crawl(args) -> int:
         for future in futures:
             future.cancel()
         executor.shutdown(wait=False, cancel_futures=True)
+        source_progress[source_csv["path"]] = {
+            "csv_name": source_csv["name"],
+            "next_row_index": last_completed_row_index,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
         receipt_writer.flush()
         write_checkpoint(
             checkpoint_path,
@@ -451,6 +551,8 @@ def crawl(args) -> int:
                 label_counts=label_counts,
                 probe_status_counts=probe_status_counts,
                 receipt_shard=receipt_writer.snapshot(),
+                source_csv=source_csv,
+                source_progress=source_progress,
             ),
         )
 
