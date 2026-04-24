@@ -315,6 +315,51 @@ def extract_title(text: str) -> str | None:
     return title or None
 
 
+def final_host(url: str | None) -> str | None:
+    if not url:
+        return None
+    try:
+        return (urlsplit(url).netloc or "").lower() or None
+    except ValueError:
+        return None
+
+
+def is_cross_host_redirect(fetch: FetchResponse) -> bool:
+    requested_host = final_host(fetch.requested_url)
+    final_redirect_host = final_host(fetch.final_url)
+    return bool(requested_host and final_redirect_host and requested_host != final_redirect_host)
+
+
+def is_login_like_host(host: str | None) -> bool:
+    if not host:
+        return False
+    markers = (
+        "login.",
+        "signin.",
+        "auth.",
+        "sso.",
+        "passport.",
+        "accounts.",
+        "id.",
+    )
+    return any(marker in host for marker in markers)
+
+
+def is_login_handoff_body(text: str) -> bool:
+    lower_text = text.lower()
+    markers = (
+        "retpath",
+        "is_autologin",
+        "passport",
+        "signin",
+        "login",
+        "document.createelement('form')",
+        "document.createelement(\"form\")",
+    )
+    matches = sum(1 for marker in markers if marker in lower_text)
+    return matches >= 2
+
+
 def parse_price(value: Any) -> float | None:
     if value is None:
         return None
@@ -462,8 +507,11 @@ def validate_llms(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
     text = decode_body(fetch.body).strip()
     if not text:
         return False, "llms document was empty", {}
-    if "<html" in text.lower():
+    lower_text = text.lower()
+    if "<html" in lower_text or "<body" in lower_text or "<script" in lower_text:
         return False, "llms document looked like HTML fallback", {}
+    if is_login_handoff_body(text):
+        return False, "llms document looked like a login handoff page", {}
     return True, "Non-empty llms text detected", {"char_count": len(text)}
 
 
@@ -471,6 +519,8 @@ def validate_commerce(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
     text = decode_body(fetch.body).strip()
     if not text:
         return False, "commerce document was empty", {}
+    if is_login_handoff_body(text):
+        return False, "commerce document looked like a login handoff page", {}
 
     if is_json_content_type(fetch.content_type) or text[:1] in "[{":
         try:
@@ -491,6 +541,8 @@ def validate_commerce(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
         return True, "Structured commerce list detected", {"item_count": len(payload)}
 
     lower_text = text.lower()
+    if "<html" in lower_text or "<body" in lower_text or "<script" in lower_text:
+        return False, "commerce document looked like HTML fallback", {}
     keywords = ("price", "offer", "checkout", "payment", "purchase", "commerce")
     if any(keyword in lower_text for keyword in keywords):
         return True, "Commerce text with pricing or purchase language detected", {"char_count": len(text)}
@@ -639,6 +691,8 @@ def validate_x402(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
         return False, "x402 document was empty", {}
 
     lower_text = text.lower()
+    if is_login_handoff_body(text):
+        return False, "x402 document looked like a login handoff page", {}
     if is_json_content_type(fetch.content_type) or text[:1] in "[{":
         try:
             payload = parse_json_body(fetch)
@@ -659,6 +713,8 @@ def validate_x402(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
 
         return False, "x402 payload was empty or unsupported", {}
 
+    if "<html" in lower_text or "<body" in lower_text or "<script" in lower_text:
+        return False, "x402 document looked like HTML fallback", {}
     if "x402" in lower_text or "payment required" in lower_text:
         return True, "x402-like text detected", {"char_count": len(text)}
     return False, "x402 text lacked x402/payment language", {"char_count": len(text)}
@@ -754,6 +810,19 @@ def build_outcome(
     fetch: FetchResponse,
     control: FetchResponse | None = None,
 ) -> ProbeOutcome:
+    if spec.key != "homepage" and is_cross_host_redirect(fetch) and is_login_like_host(final_host(fetch.final_url)):
+        return ProbeOutcome(
+            key=spec.key,
+            path=spec.path,
+            status="gated",
+            http_status=fetch.status,
+            content_type=fetch.content_type,
+            final_url=fetch.final_url,
+            byte_count=fetch.byte_count,
+            body_sha256=fetch.body_sha256,
+            detail="Cross-host redirect to login/auth host",
+        )
+
     if fetch.status == 404:
         return ProbeOutcome(
             key=spec.key,

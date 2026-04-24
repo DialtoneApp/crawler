@@ -34,6 +34,8 @@
 - Replaced the single append-only receipt log with rotated receipt shards under `results/receipts/`.
 - Added shard-aware checkpoint state so resume continues from the active shard instead of assuming one giant file.
 - Added `KeyboardInterrupt` handling so `Ctrl-C` writes a checkpoint immediately instead of only at the next periodic checkpoint boundary.
+- Added login-wall detection so cross-host redirects into auth/SSO hosts are marked as `gated` instead of becoming positives.
+- Tightened `llms`, `commerce`, and `x402` validation so HTML/script handoff pages do not count as valid machine-readable documents.
 - Increased byte caps for `openapi.json` and `products.json` so large but real documents are less likely to be misclassified as invalid.
 - Reworked checkpoint progress tracking so the next row index is tracked explicitly instead of depending on the last loop variable.
 
