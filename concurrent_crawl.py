@@ -130,6 +130,13 @@ class CrawlReceipt:
     aggregates: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class ReceiptShardState:
+    shard_index: int = 1
+    record_count: int = 0
+    byte_count: int = 0
+
+
 BASE_PROBES = (
     ProbeSpec("homepage", "/", "homepage", max_bytes=32_768),
     ProbeSpec("robots_txt", "/robots.txt", "robots", control_group="text"),
@@ -189,6 +196,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=100,
         help="Persist checkpoint metadata every N completed domains.",
+    )
+    parser.add_argument(
+        "--receipt-shard-max-bytes",
+        type=int,
+        default=128 * 1024 * 1024,
+        help="Rotate receipt NDJSON shards after this many bytes. Use 0 to disable byte-based rotation.",
+    )
+    parser.add_argument(
+        "--receipt-shard-max-records",
+        type=int,
+        default=100_000,
+        help="Rotate receipt NDJSON shards after this many records. Use 0 to disable record-based rotation.",
     )
     parser.add_argument(
         "--no-resume",
@@ -1038,6 +1057,91 @@ def write_checkpoint(path: Path, payload: dict[str, Any]) -> None:
     temp_path.replace(path)
 
 
+class ReceiptShardWriter:
+    def __init__(
+        self,
+        receipts_dir: Path,
+        *,
+        max_bytes: int,
+        max_records: int,
+        initial_state: ReceiptShardState | None = None,
+    ) -> None:
+        self.receipts_dir = receipts_dir
+        self.max_bytes = max(0, max_bytes)
+        self.max_records = max(0, max_records)
+        self.state = initial_state or ReceiptShardState()
+        self._file: Any | None = None
+
+    def __enter__(self) -> "ReceiptShardWriter":
+        self.receipts_dir.mkdir(parents=True, exist_ok=True)
+        self._open_current_shard()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.close()
+
+    @property
+    def current_path(self) -> Path:
+        return self.receipts_dir / f"receipt-{self.state.shard_index:06d}.ndjson"
+
+    def _open_current_shard(self) -> None:
+        if self._file is not None:
+            self._file.close()
+        self._file = self.current_path.open("a", encoding="utf-8")
+
+        try:
+            existing_size = self.current_path.stat().st_size
+        except OSError:
+            existing_size = 0
+
+        if existing_size > self.state.byte_count:
+            self.state.byte_count = existing_size
+
+    def _rotate(self) -> None:
+        if self._file is not None:
+            self._file.close()
+        self.state = ReceiptShardState(shard_index=self.state.shard_index + 1)
+        self._open_current_shard()
+
+    def _should_rotate(self, encoded_length: int) -> bool:
+        if self.state.record_count == 0:
+            return False
+        if self.max_records and self.state.record_count >= self.max_records:
+            return True
+        if self.max_bytes and (self.state.byte_count + encoded_length) > self.max_bytes:
+            return True
+        return False
+
+    def write_line(self, line: str) -> None:
+        encoded_length = len((line + "\n").encode("utf-8"))
+        if self._should_rotate(encoded_length):
+            self._rotate()
+
+        if self._file is None:
+            self._open_current_shard()
+
+        self._file.write(line)
+        self._file.write("\n")
+        self.state.record_count += 1
+        self.state.byte_count += encoded_length
+
+    def flush(self) -> None:
+        if self._file is not None:
+            self._file.flush()
+
+    def close(self) -> None:
+        if self._file is not None:
+            self._file.close()
+            self._file = None
+
+    def snapshot(self) -> dict[str, int]:
+        return {
+            "shard_index": self.state.shard_index,
+            "record_count": self.state.record_count,
+            "byte_count": self.state.byte_count,
+        }
+
+
 def has_interesting_signal(receipt: CrawlReceipt) -> bool:
     return any(
         receipt.probes.get(key) and receipt.probes[key].status == "valid"
@@ -1053,6 +1157,7 @@ def build_checkpoint_payload(
     started_at: float,
     label_counts: Counter[str],
     probe_status_counts: Counter[str],
+    receipt_shard: dict[str, int],
 ) -> dict[str, Any]:
     return {
         "completed": completed,
@@ -1062,24 +1167,32 @@ def build_checkpoint_payload(
         "elapsed_seconds": round(max(time.monotonic() - started_at, 0.0), 3),
         "label_counts": dict(sorted(label_counts.items())),
         "probe_status_counts": dict(sorted(probe_status_counts.items())),
+        "receipt_shard": receipt_shard,
     }
 
 
 def crawl(args: argparse.Namespace) -> int:
     csv_path = Path(args.csv)
     results_dir = Path(args.results_dir)
-    receipt_log_path = results_dir / "receipts.ndjson"
+    receipts_dir = results_dir / "receipts"
     positives_dir = results_dir / "positives"
     checkpoint_path = results_dir / "checkpoint.json"
 
     if args.concurrency < 1:
         print("--concurrency must be at least 1", file=sys.stderr)
         return 2
+    if args.receipt_shard_max_bytes < 0:
+        print("--receipt-shard-max-bytes must be 0 or greater", file=sys.stderr)
+        return 2
+    if args.receipt_shard_max_records < 0:
+        print("--receipt-shard-max-records must be 0 or greater", file=sys.stderr)
+        return 2
     if not csv_path.exists():
         print(f"CSV file not found: {csv_path}", file=sys.stderr)
         return 2
 
     results_dir.mkdir(parents=True, exist_ok=True)
+    receipts_dir.mkdir(parents=True, exist_ok=True)
     positives_dir.mkdir(parents=True, exist_ok=True)
 
     checkpoint = None if args.no_resume else load_checkpoint(checkpoint_path)
@@ -1088,15 +1201,21 @@ def crawl(args: argparse.Namespace) -> int:
     found = int(checkpoint.get("found", 0)) if checkpoint else 0
     label_counts: Counter[str] = Counter(checkpoint.get("label_counts", {})) if checkpoint else Counter()
     probe_status_counts: Counter[str] = Counter(checkpoint.get("probe_status_counts", {})) if checkpoint else Counter()
+    checkpoint_receipt_shard = checkpoint.get("receipt_shard", {}) if checkpoint else {}
+    receipt_shard_state = ReceiptShardState(
+        shard_index=max(1, int(checkpoint_receipt_shard.get("shard_index", 1))),
+        record_count=max(0, int(checkpoint_receipt_shard.get("record_count", 0))),
+        byte_count=max(0, int(checkpoint_receipt_shard.get("byte_count", 0))),
+    )
 
     if checkpoint and not args.no_resume:
         print(
-            f"resuming from row_index={start_row_index} completed={completed} found={found}",
+            f"resuming from row_index={start_row_index} completed={completed} found={found} shard=receipt-{receipt_shard_state.shard_index:06d}",
             file=sys.stderr,
         )
-    elif args.no_resume and receipt_log_path.exists():
+    elif args.no_resume and any(receipts_dir.glob("receipt-*.ndjson")):
         print(
-            f"--no-resume requested; appending fresh rows to existing {receipt_log_path}",
+            f"--no-resume requested; appending fresh rows into {receipts_dir}",
             file=sys.stderr,
         )
 
@@ -1109,7 +1228,12 @@ def crawl(args: argparse.Namespace) -> int:
     run_token = hex(int(started_at * 1_000_000))[2:]
     last_completed_row_index = start_row_index
 
-    with receipt_log_path.open("a", encoding="utf-8") as receipt_file:
+    with ReceiptShardWriter(
+        receipts_dir,
+        max_bytes=args.receipt_shard_max_bytes,
+        max_records=args.receipt_shard_max_records,
+        initial_state=receipt_shard_state,
+    ) as receipt_writer:
         with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
             for _ in range(args.concurrency):
                 if not submit_next(executor, futures, domains, args.timeout, run_token):
@@ -1143,8 +1267,7 @@ def crawl(args: argparse.Namespace) -> int:
                         probe_status_counts[f"{outcome.key}:{outcome.status}"] += 1
 
                     serialized = serialize_receipt(receipt)
-                    receipt_file.write(json.dumps(serialized, separators=(",", ":"), sort_keys=True))
-                    receipt_file.write("\n")
+                    receipt_writer.write_line(json.dumps(serialized, separators=(",", ":"), sort_keys=True))
 
                     if has_interesting_signal(receipt):
                         found += 1
@@ -1168,6 +1291,7 @@ def crawl(args: argparse.Namespace) -> int:
                         )
 
                     if args.checkpoint_every and completed % args.checkpoint_every == 0:
+                        receipt_writer.flush()
                         write_checkpoint(
                             checkpoint_path,
                             build_checkpoint_payload(
@@ -1177,6 +1301,7 @@ def crawl(args: argparse.Namespace) -> int:
                                 started_at=started_at,
                                 label_counts=label_counts,
                                 probe_status_counts=probe_status_counts,
+                                receipt_shard=receipt_writer.snapshot(),
                             ),
                         )
 
@@ -1191,10 +1316,11 @@ def crawl(args: argparse.Namespace) -> int:
             started_at=started_at,
             label_counts=label_counts,
             probe_status_counts=probe_status_counts,
+            receipt_shard=receipt_writer.snapshot(),
         ),
     )
     print(
-        f"done completed={completed} found={found} labels={dict(label_counts.most_common())}",
+        f"done completed={completed} found={found} shard=receipt-{receipt_writer.state.shard_index:06d} labels={dict(label_counts.most_common())}",
         file=sys.stderr,
     )
     return 0

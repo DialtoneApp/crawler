@@ -31,12 +31,14 @@
 - Added compact NDJSON receipt logging plus:
   - `checkpoint.json`
   - `positives/<domain>.json`
+- Replaced the single append-only receipt log with rotated receipt shards under `results/receipts/`.
+- Added shard-aware checkpoint state so resume continues from the active shard instead of assuming one giant file.
 - Increased byte caps for `openapi.json` and `products.json` so large but real documents are less likely to be misclassified as invalid.
 - Reworked checkpoint progress tracking so the next row index is tracked explicitly instead of depending on the last loop variable.
 
 ### Output model now
 
-- `results/receipts.ndjson`: one compact receipt line per crawled domain
+- `results/receipts/receipt-000001.ndjson` and later shards: compact receipt lines for all crawled domains
 - `results/checkpoint.json`: explicit resume state
 - `results/positives/*.json`: expanded JSON for interesting domains
 
@@ -44,7 +46,6 @@
 
 - Split the crawl into explicit broad-pass and enrichment-pass modes instead of doing them in one function.
 - Add domain-range sharding so multiple Mac Studio processes can work on different slices of `top-1m.csv`.
-- Move from one append-only NDJSON file to rotated shards once the format stabilizes.
 - Add richer action-surface detection from homepage links and selective deep probes beyond `/openapi.json` and `/products.json`.
 - Add post-processing scripts to build:
   - compact Cloudflare receipt payloads
