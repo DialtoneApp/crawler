@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import re
 from typing import Any
 from urllib.parse import urljoin, urlsplit
@@ -10,6 +11,8 @@ from .models import FetchResponse
 
 TEMPLATE_PARAMETER_RE = re.compile(r"\{([^{}]+)\}")
 ABSOLUTE_URL_RE = re.compile(r"https?://[^\s<>()\"']+")
+LINK_TAG_RE = re.compile(r"<link\b[^>]*>", re.IGNORECASE)
+HTML_ATTR_RE = re.compile(r'([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*("([^"]*)"|\'([^\']*)\'|([^\s>]+))')
 
 
 def normalize_content_type(content_type: str | None) -> str | None:
@@ -109,6 +112,40 @@ def derive_well_known_url(base_url: str | None, well_known_path: str) -> str | N
 
 def derive_x402_discovery_url(base_url: str | None) -> str | None:
     return derive_well_known_url(base_url, "/.well-known/x402.json")
+
+
+def parse_html_attributes(tag_text: str) -> dict[str, str]:
+    attributes: dict[str, str] = {}
+    if not isinstance(tag_text, str) or not tag_text:
+        return attributes
+    for match in HTML_ATTR_RE.finditer(tag_text):
+        key = (match.group(1) or "").strip().lower()
+        value = match.group(3) or match.group(4) or match.group(5) or ""
+        if key and key not in attributes:
+            attributes[key] = html.unescape(value.strip())
+    return attributes
+
+
+def extract_link_urls_by_rel(text: str, *, rel_token: str, base_url: str | None = None) -> list[str]:
+    if not isinstance(text, str) or not text:
+        return []
+    rel_lower = rel_token.strip().lower()
+    if not rel_lower:
+        return []
+    urls: list[str] = []
+    for match in LINK_TAG_RE.finditer(text):
+        attrs = parse_html_attributes(match.group(0))
+        rel_value = attrs.get("rel", "")
+        href_value = attrs.get("href")
+        if not href_value:
+            continue
+        rel_tokens = {part.strip().lower() for part in rel_value.split() if part.strip()}
+        if rel_lower not in rel_tokens:
+            continue
+        resolved_url = resolve_url(base_url, href_value) or href_value.strip()
+        if resolved_url and resolved_url not in urls:
+            urls.append(resolved_url)
+    return urls
 
 
 def extract_template_parameters(value: str | None) -> list[str]:

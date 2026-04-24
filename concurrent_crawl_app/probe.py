@@ -413,6 +413,11 @@ def probe_domain(domain_input: DomainInput, timeout: float, run_token: str):
         url
         for url in [
             agent_facts.get("openapi_url"),
+            *(
+                homepage_outcome.facts.get("service_desc_urls")
+                if isinstance(homepage_outcome.facts.get("service_desc_urls"), list)
+                else []
+            ),
         ]
         if isinstance(url, str) and url
     ]

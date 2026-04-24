@@ -8,6 +8,7 @@ from .helpers import (
     decode_body,
     derive_x402_discovery_url,
     extract_absolute_urls,
+    extract_link_urls_by_rel,
     extract_title,
     final_host,
     flatten_strings,
@@ -37,19 +38,30 @@ def validate_homepage(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
     text = decode_body(fetch.body)
     lower_text = text.lower()
     title = extract_title(text)
+    base_reference = fetch.final_url or fetch.requested_url
     shopify_hint = (
         "shopify" in lower_text
         or "myshopify.com" in lower_text
         or "cdn.shopify.com" in lower_text
     )
+    service_desc_urls = extract_link_urls_by_rel(text, rel_token="service-desc", base_url=base_reference)
+    service_meta_urls = extract_link_urls_by_rel(text, rel_token="service-meta", base_url=base_reference)
+    api_catalog_urls = extract_link_urls_by_rel(text, rel_token="api-catalog", base_url=base_reference)
+    facts = {"title": title, "shopify_hint": shopify_hint}
+    if service_desc_urls:
+        facts["service_desc_urls"] = service_desc_urls
+    if service_meta_urls:
+        facts["service_meta_urls"] = service_meta_urls
+    if api_catalog_urls:
+        facts["api_catalog_urls"] = api_catalog_urls
 
     if is_html_content_type(fetch.content_type) or "<html" in lower_text or title:
-        return True, "Fetched homepage HTML", {"title": title, "shopify_hint": shopify_hint}
+        return True, "Fetched homepage HTML", facts
 
     if is_text_content_type(fetch.content_type):
-        return True, "Fetched non-HTML homepage text", {"title": title, "shopify_hint": shopify_hint}
+        return True, "Fetched non-HTML homepage text", facts
 
-    return False, "Homepage did not look like HTML or text", {"title": title, "shopify_hint": shopify_hint}
+    return False, "Homepage did not look like HTML or text", facts
 
 
 def validate_robots(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:

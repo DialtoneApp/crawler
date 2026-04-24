@@ -75,6 +75,7 @@
 - Added off-origin x402 discovery so the crawler can follow `llms.txt` and `agent.json` hints to a remote `/.well-known/x402.json` manifest, validate it, and use its sample actions for the live payment probe. This fixes sites like `x402engine.app` that publish discovery on one host and execute paid actions on another.
 - Raised x402 probe byte caps to `524 KB` so larger manifests do not get dropped as truncated noise before the crawler can extract priced actions and payment probes.
 - Added x402 `extensions.bazaar.info.input` parsing so manifests that describe the payable HTTP request inline can generate a concrete probe candidate and a cleaner sample action. This fixes surfaces like `quicknode.com`, where the x402 manifest is the only public machine-readable contract.
+- Added homepage HTML discovery parsing for `rel="service-desc"`, `rel="service-meta"`, and `rel="api-catalog"`. The crawler now follows homepage-advertised OpenAPI specs like `pull.md`'s `/api/openapi.json` even when `/openapi.json` and `agent.json` are absent.
 
 ### Output model now
 
