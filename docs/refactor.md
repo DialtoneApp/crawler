@@ -72,6 +72,8 @@
 - Added payment-probe candidate ranking so the crawler prefers higher-intent actions like `send`, `buy`, `report`, or `search` over low-signal endpoints like `status` or message listing.
 - Added templated payment-probe resolution for OpenAPI commerce sites. When a paid route uses a path parameter like `{slug}`, the crawler now tries to resolve a real public resource from a sibling collection endpoint before probing the paid URL, and it carries sample title/price details into the receipt when available.
 - Added a Shopify UCP catalog fallback for stores that expose a valid `/.well-known/ucp` but block `products.json`. The crawler now extracts the store MCP endpoint from UCP, calls `search_catalog` with a valid Shopify agent profile, prefers a filters-only search first, and only falls back to a few neutral title/domain-derived query tokens when needed.
+- Added off-origin x402 discovery so the crawler can follow `llms.txt` and `agent.json` hints to a remote `/.well-known/x402.json` manifest, validate it, and use its sample actions for the live payment probe. This fixes sites like `x402engine.app` that publish discovery on one host and execute paid actions on another.
+- Raised x402 probe byte caps to `524 KB` so larger manifests do not get dropped as truncated noise before the crawler can extract priced actions and payment probes.
 
 ### Output model now
 

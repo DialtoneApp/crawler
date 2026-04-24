@@ -63,6 +63,7 @@ INTERESTING_PROBE_KEYS = {
     "payment_probe",
     "x402_json",
     "x402_well_known",
+    "remote_x402",
     "products_json",
     "api_products",
 }
@@ -88,8 +89,8 @@ BASE_PROBES = (
     ProbeSpec("well_known_agent_card", "/.well-known/agent-card.json", "agent", max_bytes=131_072, control_group="json_well_known"),
     ProbeSpec("root_agent_json", "/agent.json", "agent", max_bytes=131_072, control_group="json_root"),
     ProbeSpec("openapi_json", "/openapi.json", "openapi", max_bytes=262_144, control_group="json_root"),
-    ProbeSpec("x402_well_known", "/.well-known/x402", "x402", max_bytes=131_072, control_group="json_well_known"),
-    ProbeSpec("x402_json", "/.well-known/x402.json", "x402", max_bytes=131_072, control_group="json_well_known"),
+    ProbeSpec("x402_well_known", "/.well-known/x402", "x402", max_bytes=524_288, control_group="json_well_known"),
+    ProbeSpec("x402_json", "/.well-known/x402.json", "x402", max_bytes=524_288, control_group="json_well_known"),
 )
 
 PRODUCTS_PROBE = ProbeSpec("products_json", "/products.json", "products", max_bytes=524_288, control_group="catalog")

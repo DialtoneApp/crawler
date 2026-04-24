@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from .helpers import collect_payment_hints, final_host, merge_unique_limited, resolve_url
+from .helpers import collect_payment_hints, derive_x402_discovery_url, final_host, merge_unique_limited, resolve_url
 from .http_client import parse_json_body
 from .models import FetchResponse
 from .validators_support import (
@@ -46,7 +46,9 @@ def validate_agent(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
         return False, "agent JSON lacked expected agent-like keys", {"top_level_keys": sorted(str(key) for key in keys)[:12]}
 
     base_reference = fetch.final_url or fetch.requested_url
+    top_level_url = resolve_url(base_reference, payload.get("url"))
     api = payload.get("api") if isinstance(payload.get("api"), dict) else {}
+    authentication = payload.get("authentication") if isinstance(payload.get("authentication"), dict) else {}
     discovery = payload.get("discovery") if isinstance(payload.get("discovery"), dict) else {}
     endpoints = payload.get("endpoints") if isinstance(payload.get("endpoints"), dict) else {}
     payment = payload.get("payment") if isinstance(payload.get("payment"), dict) else {}
@@ -56,9 +58,16 @@ def validate_agent(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
     api_base_url = resolve_url(base_reference, api.get("base_url"))
     docs_url = resolve_url(base_reference, api.get("docs")) or resolve_url(base_reference, discovery.get("docs"))
     openapi_url = resolve_url(base_reference, discovery.get("openapi")) or resolve_url(base_reference, api.get("openapi"))
-    x402_url = resolve_url(base_reference, discovery.get("x402"))
+    x402_url = (
+        resolve_url(base_reference, discovery.get("x402"))
+        or resolve_url(base_reference, x402.get("url"))
+        or resolve_url(base_reference, x402.get("discovery"))
+    )
     brand_facts_url = resolve_url(base_reference, discovery.get("brand_facts"))
     llms_url = resolve_url(base_reference, discovery.get("llms_txt"))
+    x402_urls: list[str] = []
+    if x402_url:
+        x402_urls = merge_unique_limited(x402_urls, [x402_url], limit=8)
 
     public_endpoint_urls: list[str] = []
     product_urls: list[str] = []
@@ -89,6 +98,10 @@ def validate_agent(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
 
     payment_protocol = payment.get("protocol") if isinstance(payment.get("protocol"), str) else None
     recommended_client = payment.get("recommended_client") if isinstance(payment.get("recommended_client"), str) else None
+    auth_schemes = authentication.get("schemes") if isinstance(authentication.get("schemes"), list) else []
+    if not auth_schemes and isinstance(payload.get("auth"), dict):
+        auth_payload = payload.get("auth")
+        auth_schemes = auth_payload.get("schemes") if isinstance(auth_payload.get("schemes"), list) else []
     payment_network_names: list[str] = []
     payment_chain_ids: list[str] = []
     payment_currency_codes: list[str] = []
@@ -117,6 +130,11 @@ def validate_agent(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
     x402_asset = x402.get("asset") if isinstance(x402.get("asset"), str) else None
     x402_facilitator = x402.get("facilitator") if isinstance(x402.get("facilitator"), str) else None
     x402_endpoints = x402.get("endpoints") if isinstance(x402.get("endpoints"), dict) else {}
+    x402_signaled = bool(
+        (isinstance(payment_protocol, str) and payment_protocol.strip().lower() == "x402")
+        or any(isinstance(scheme, str) and scheme.strip().lower() == "x402" for scheme in auth_schemes)
+        or bool(x402)
+    )
     if x402_network:
         payment_network_names = merge_unique_limited(payment_network_names, [x402_network], limit=12)
     if x402_asset:
@@ -126,6 +144,13 @@ def validate_agent(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
         facilitator_host = final_host(x402_facilitator)
         if facilitator_host:
             payment_assets = merge_unique_limited(payment_assets, [x402_asset] if x402_asset else [], limit=12)
+    if x402_signaled:
+        for base_candidate in (top_level_url, api_base_url):
+            derived_x402_url = derive_x402_discovery_url(base_candidate)
+            if derived_x402_url:
+                x402_urls = merge_unique_limited(x402_urls, [derived_x402_url], limit=8)
+    if not x402_url and x402_urls:
+        x402_url = x402_urls[0]
     (
         x402_resource_urls,
         x402_sample_actions,
@@ -170,10 +195,12 @@ def validate_agent(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
 
     return True, "Agent-like JSON detected", {
         "top_level_keys": sorted(str(key) for key in keys)[:12],
+        "service_url": top_level_url,
         "api_base_url": api_base_url,
         "docs_url": docs_url,
         "openapi_url": openapi_url,
         "x402_url": x402_url,
+        "x402_urls": x402_urls,
         "brand_facts_url": brand_facts_url,
         "llms_url": llms_url,
         "public_endpoint_urls": public_endpoint_urls,

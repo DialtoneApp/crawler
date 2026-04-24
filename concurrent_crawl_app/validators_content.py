@@ -6,6 +6,8 @@ from typing import Any
 from .helpers import (
     collect_payment_hints,
     decode_body,
+    derive_x402_discovery_url,
+    extract_absolute_urls,
     extract_title,
     final_host,
     flatten_strings,
@@ -84,7 +86,30 @@ def validate_llms(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
         return False, "llms document looked like HTML fallback", {}
     if is_login_handoff_body(text):
         return False, "llms document looked like a login handoff page", {}
-    return True, "Non-empty llms text detected", {"char_count": len(text)}
+    discovered_urls = extract_absolute_urls(text)
+    x402_urls: list[str] = []
+    for url in discovered_urls:
+        if "/.well-known/x402" in url.lower():
+            x402_urls = merge_unique_limited(x402_urls, [url], limit=8)
+
+    has_x402_markers = "x402" in lower_text or "payment required" in lower_text
+    if has_x402_markers:
+        for line in text.splitlines():
+            line_urls = extract_absolute_urls(line)
+            if not line_urls:
+                continue
+            lower_line = line.lower()
+            if not any(marker in lower_line for marker in ("api base", "base url", "rest api base", "gateway", "base:")):
+                continue
+            for url in line_urls:
+                derived_x402_url = derive_x402_discovery_url(url)
+                if derived_x402_url:
+                    x402_urls = merge_unique_limited(x402_urls, [derived_x402_url], limit=8)
+
+    facts: dict[str, Any] = {"char_count": len(text)}
+    if x402_urls:
+        facts["x402_urls"] = x402_urls
+    return True, "Non-empty llms text detected", facts
 
 
 def validate_commerce(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:

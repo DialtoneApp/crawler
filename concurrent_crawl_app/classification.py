@@ -70,6 +70,7 @@ def merge_agent_facts(outcomes: dict[str, ProbeOutcome]) -> dict[str, Any]:
         "order_urls",
         "register_urls",
         "wallet_guides_urls",
+        "x402_urls",
         "payment_network_names",
         "payment_chain_ids",
         "payment_currency_codes",
@@ -79,6 +80,7 @@ def merge_agent_facts(outcomes: dict[str, ProbeOutcome]) -> dict[str, Any]:
         "payment_endpoint_hosts",
     }
     scalar_keys = {
+        "service_url",
         "api_base_url",
         "docs_url",
         "openapi_url",
@@ -157,6 +159,7 @@ def classify_receipt(
         "root_agent_json",
         "x402_json",
         "x402_well_known",
+        "remote_x402",
         "payment_probe",
     } & valid_keys:
         tags.append("callable_surface")
@@ -229,9 +232,11 @@ def classify_receipt(
     if agent_facts:
         for key in (
             "api_base_url",
+            "service_url",
             "docs_url",
             "openapi_url",
             "x402_url",
+            "x402_urls",
             "brand_facts_url",
             "llms_url",
             "public_endpoint_urls",
@@ -403,7 +408,7 @@ def classify_receipt(
         if bool(ucp.facts.get("crypto_only")):
             crypto_only = True
 
-    x402 = best_valid_outcome(outcomes, ("x402_json", "x402_well_known"))
+    x402 = best_valid_outcome(outcomes, ("x402_json", "x402_well_known", "remote_x402"))
     if x402 and x402.status == "valid":
         for key in (
             "resource_urls",
@@ -447,7 +452,7 @@ def classify_receipt(
         if int(x402.facts.get("priced_action_count") or 0) > priced_action_count:
             priced_action_count = int(x402.facts.get("priced_action_count") or 0)
 
-    if {"x402_json", "x402_well_known"} & valid_keys:
+    if {"x402_json", "x402_well_known", "remote_x402"} & valid_keys:
         payment_provider_hints = merge_unique_limited(payment_provider_hints, ["x402"], limit=12)
         payment_rail_hints = merge_unique_limited(payment_rail_hints, ["x402"], limit=12)
         payment_surface = "x402"

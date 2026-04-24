@@ -9,6 +9,7 @@ from .models import FetchResponse
 
 
 TEMPLATE_PARAMETER_RE = re.compile(r"\{([^{}]+)\}")
+ABSOLUTE_URL_RE = re.compile(r"https?://[^\s<>()\"']+")
 
 
 def normalize_content_type(content_type: str | None) -> str | None:
@@ -77,6 +78,37 @@ def resolve_url(base_url: str | None, candidate: Any) -> str | None:
         return urljoin(base_url, candidate)
     except ValueError:
         return None
+
+
+def extract_absolute_urls(text: str) -> list[str]:
+    if not isinstance(text, str) or not text:
+        return []
+    results: list[str] = []
+    for match in ABSOLUTE_URL_RE.findall(text):
+        cleaned = match.rstrip("),.;:!?]}>\"'")
+        if cleaned and cleaned not in results:
+            results.append(cleaned)
+    return results
+
+
+def derive_well_known_url(base_url: str | None, well_known_path: str) -> str | None:
+    if not isinstance(well_known_path, str) or not well_known_path.strip():
+        return None
+    if not isinstance(base_url, str) or not base_url.strip():
+        return None
+    try:
+        parsed = urlsplit(base_url)
+    except ValueError:
+        return None
+    if not parsed.scheme or not parsed.netloc:
+        return None
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    normalized_path = well_known_path if well_known_path.startswith("/") else f"/{well_known_path}"
+    return resolve_url(origin, normalized_path)
+
+
+def derive_x402_discovery_url(base_url: str | None) -> str | None:
+    return derive_well_known_url(base_url, "/.well-known/x402.json")
 
 
 def extract_template_parameters(value: str | None) -> list[str]:

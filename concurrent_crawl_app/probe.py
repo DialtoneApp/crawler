@@ -93,6 +93,7 @@ def iter_payment_probe_candidates(outcomes: dict[str, ProbeOutcome]):
         "openapi_json",
         "x402_json",
         "x402_well_known",
+        "remote_x402",
         "well_known_agent_json",
         "root_agent_json",
         "well_known_agent_card",
@@ -313,6 +314,42 @@ def resolve_template_candidate(candidate: dict[str, object], timeout: float) -> 
     return resolved_candidate, None
 
 
+def iter_remote_x402_candidate_urls(
+    domain: str,
+    outcomes: dict[str, ProbeOutcome],
+    agent_facts: dict[str, Any],
+):
+    seen: set[str] = set()
+    local_urls = {
+        f"https://{domain}/.well-known/x402",
+        f"https://{domain}/.well-known/x402.json",
+    }
+
+    def append_values(target: list[str], value: object) -> list[str]:
+        if isinstance(value, str) and value.strip():
+            target.append(value.strip())
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, str) and item.strip():
+                    target.append(item.strip())
+        return target
+
+    candidates: list[str] = []
+    for key in ("llms_txt", "llms_full_txt"):
+        outcome = outcomes.get(key)
+        if outcome and outcome.status == "valid":
+            candidates = append_values(candidates, outcome.facts.get("x402_urls"))
+
+    candidates = append_values(candidates, agent_facts.get("x402_url"))
+    candidates = append_values(candidates, agent_facts.get("x402_urls"))
+
+    for candidate_url in candidates:
+        if candidate_url in seen or candidate_url in local_urls:
+            continue
+        seen.add(candidate_url)
+        yield candidate_url
+
+
 def probe_domain(domain_input: DomainInput, timeout: float, run_token: str):
     domain = domain_input.domain
     outcomes: dict[str, ProbeOutcome] = {}
@@ -392,6 +429,27 @@ def probe_domain(domain_input: DomainInput, timeout: float, run_token: str):
             )
             outcomes["api_openapi_json"] = api_openapi_outcome
             if api_openapi_outcome.status == "valid":
+                break
+
+    local_x402_outcome = next(
+        (
+            outcomes[key]
+            for key in ("x402_json", "x402_well_known")
+            if key in outcomes and outcomes[key].status == "valid"
+        ),
+        None,
+    )
+    if local_x402_outcome is None:
+        for candidate_url in iter_remote_x402_candidate_urls(domain, outcomes, agent_facts):
+            remote_x402_outcome = build_dynamic_probe_outcome(
+                key="remote_x402",
+                url=candidate_url,
+                validator="x402",
+                timeout=timeout,
+                max_bytes=BASE_PROBES[12].max_bytes,
+            )
+            outcomes["remote_x402"] = remote_x402_outcome
+            if remote_x402_outcome.status == "valid":
                 break
 
     api_product_candidate_urls = [
