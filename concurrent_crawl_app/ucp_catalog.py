@@ -12,55 +12,15 @@ from .validators_catalog import validate_products
 SHOPIFY_UCP_AGENT_PROFILE = "https://shopify.dev/ucp/agent-profiles/2026-04-08/valid-with-capabilities.json"
 TOKEN_RE = re.compile(r"[a-zA-Z]{4,}")
 
-CATEGORY_QUERY_TOKENS = {
-    "accessories",
-    "anklets",
-    "bag",
-    "bags",
-    "beauty",
-    "boots",
-    "bra",
-    "bridal",
-    "dress",
-    "dresses",
-    "earring",
-    "earrings",
-    "footwear",
-    "gown",
-    "gowns",
-    "jacket",
-    "jackets",
-    "jewellery",
-    "jewelry",
-    "lingerie",
-    "loafers",
-    "necklace",
-    "ring",
-    "rings",
-    "shoes",
-    "skirt",
-    "sneakers",
-    "suit",
-    "tuxedo",
-    "veil",
-    "wedding",
-}
-
 STOPWORD_QUERY_TOKENS = {
     "about",
-    "bridesmaid",
-    "bridesmaids",
-    "bridalwear",
     "buy",
     "collection",
     "collections",
-    "david",
-    "davids",
     "free",
     "gift",
     "gifts",
     "home",
-    "india",
     "kids",
     "life",
     "luxury",
@@ -74,8 +34,6 @@ STOPWORD_QUERY_TOKENS = {
     "store",
     "style",
     "styles",
-    "wallace",
-    "womens",
 }
 
 
@@ -94,22 +52,20 @@ def tokenize_query_candidates(*values: str | None) -> list[str]:
 def build_ucp_catalog_queries(domain: str, homepage_title: str | None) -> list[str | None]:
     title_tokens = tokenize_query_candidates(homepage_title)
     domain_tokens = tokenize_query_candidates(domain.replace(".", " ").replace("-", " "))
+    domain_token_set = set(domain_tokens)
 
-    queries: list[str | None] = []
-    for token in title_tokens + domain_tokens:
-        if token in CATEGORY_QUERY_TOKENS and token not in queries:
-            queries.append(token)
+    queries: list[str | None] = [None]
     for token in title_tokens + domain_tokens:
         if token in STOPWORD_QUERY_TOKENS:
+            continue
+        if token in domain_token_set and token not in title_tokens:
             continue
         if token in queries:
             continue
         queries.append(token)
         if len(queries) >= 4:
             break
-    if None not in queries:
-        queries.append(None)
-    return queries[:5]
+    return queries[:4]
 
 
 def build_search_catalog_payload(query: str | None, *, country_code: str | None = None) -> bytes:
