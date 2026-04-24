@@ -513,54 +513,43 @@ def export_public(args: argparse.Namespace) -> int:
             continue
         latest_receipts[domain] = receipt
 
-    index_rows: list[dict[str, Any]] = []
-    for domain in sorted(
-        latest_receipts.keys(),
-        key=lambda item: (
-            as_int(latest_receipts[item].get("rank")) is None,
-            as_int(latest_receipts[item].get("rank")) or 10**9,
-            item,
-        ),
-    ):
-        receipt = latest_receipts[domain]
-        source_evidence_dir = evidence_dir / domain
-        detail_eligible = domain in positive_domains
-        index_row, detail = build_public_receipt(
-            receipt,
-            source_evidence_dir=source_evidence_dir,
-            detail_eligible=detail_eligible,
-        )
-        index_rows.append(index_row)
-        label_counts[index_row["label"]] += 1
-
-        if detail_eligible:
-            relative_key = detail["evidence"]["receipt_r2_key"]
-            if isinstance(relative_key, str) and relative_key:
-                detail_path = output_dir / relative_key
-                detail_path.parent.mkdir(parents=True, exist_ok=True)
-                detail_path.write_text(
-                    json.dumps(detail, indent=2, sort_keys=True),
-                    encoding="utf-8",
-                )
-                maybe_copy_evidence(source_evidence_dir, output_dir, detail)
-                detail_count += 1
-
     csv_path = d1_dir / "site_receipts.csv"
-    with csv_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=INDEX_FIELDS)
-        writer.writeheader()
-        for row in index_rows:
-            writer.writerow({field: row.get(field) for field in INDEX_FIELDS})
-
     ndjson_path = d1_dir / "site_receipts.ndjson"
-    with ndjson_path.open("w", encoding="utf-8") as handle:
-        for row in index_rows:
-            handle.write(json.dumps(row, separators=(",", ":"), sort_keys=True))
-            handle.write("\n")
+    with (
+        csv_path.open("w", newline="", encoding="utf-8") as csv_handle,
+        ndjson_path.open("w", encoding="utf-8") as ndjson_handle,
+    ):
+        writer = csv.DictWriter(csv_handle, fieldnames=INDEX_FIELDS)
+        writer.writeheader()
+        for domain, receipt in latest_receipts.items():
+            source_evidence_dir = evidence_dir / domain
+            detail_eligible = domain in positive_domains
+            index_row, detail = build_public_receipt(
+                receipt,
+                source_evidence_dir=source_evidence_dir,
+                detail_eligible=detail_eligible,
+            )
+            label_counts[index_row["label"]] += 1
+
+            writer.writerow({field: index_row.get(field) for field in INDEX_FIELDS})
+            ndjson_handle.write(json.dumps(index_row, separators=(",", ":"), sort_keys=True))
+            ndjson_handle.write("\n")
+
+            if detail_eligible:
+                relative_key = detail["evidence"]["receipt_r2_key"]
+                if isinstance(relative_key, str) and relative_key:
+                    detail_path = output_dir / relative_key
+                    detail_path.parent.mkdir(parents=True, exist_ok=True)
+                    detail_path.write_text(
+                        json.dumps(detail, indent=2, sort_keys=True),
+                        encoding="utf-8",
+                    )
+                    maybe_copy_evidence(source_evidence_dir, output_dir, detail)
+                    detail_count += 1
 
     manifest = {
         "version": 1,
-        "receipt_count": len(index_rows),
+        "receipt_count": len(latest_receipts),
         "detail_receipt_count": detail_count,
         "label_counts": dict(sorted(label_counts.items())),
         "paths": {
