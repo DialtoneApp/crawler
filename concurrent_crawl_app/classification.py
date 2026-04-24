@@ -72,6 +72,14 @@ def merge_observed_schema_facts(outcomes: dict[str, ProbeOutcome]) -> dict[str, 
     return merged
 
 
+def rate_limited_outcomes(outcomes: dict[str, ProbeOutcome]) -> list[tuple[str, ProbeOutcome]]:
+    return [
+        (key, outcome)
+        for key, outcome in outcomes.items()
+        if outcome.status == "rate_limited"
+    ]
+
+
 def should_probe_products(homepage_fetch: Any, homepage_outcome: ProbeOutcome, outcomes: dict[str, ProbeOutcome]) -> bool:
     if outcomes.get("well_known_ucp", ProbeOutcome("", "", "", None, None)).status == "valid":
         return True
@@ -241,6 +249,7 @@ def classify_receipt(
 ) -> CrawlReceipt:
     tags: list[str] = []
     aggregates: dict[str, Any] = {}
+    limited_outcomes = rate_limited_outcomes(outcomes)
 
     homepage = outcomes.get("homepage")
     title = None
@@ -248,6 +257,21 @@ def classify_receipt(
         title = homepage.facts.get("title")
         if homepage.facts.get("shopify_hint"):
             tags.append("shopify_hint")
+
+    if limited_outcomes:
+        tags.append("rate_limited")
+        aggregates["rate_limited_probe_count"] = len(limited_outcomes)
+        aggregates["rate_limited_probe_keys"] = [key for key, _ in limited_outcomes][:16]
+        retry_after_seconds = sorted(
+            {
+                int(outcome.facts["retry_after_seconds"])
+                for _, outcome in limited_outcomes
+                if isinstance(outcome.facts.get("retry_after_seconds"), int)
+            }
+        )
+        if retry_after_seconds:
+            aggregates["rate_limited_retry_after_seconds"] = retry_after_seconds[0]
+            aggregates["rate_limited_retry_after_values"] = retry_after_seconds[:8]
 
     valid_keys = {key for key, outcome in outcomes.items() if outcome.status == "valid"}
     payment_provider_hints: list[str] = []
@@ -720,6 +744,8 @@ def classify_receipt(
         label = "catalog_surface"
     elif "ai_readable" in tags:
         label = "ai_readable"
+    elif limited_outcomes:
+        label = "rate_limited"
     elif homepage and homepage.status == "error":
         label = "unreachable"
     elif "crawl_basics" in tags:

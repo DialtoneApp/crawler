@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 from .helpers import (
@@ -18,6 +20,34 @@ VALIDATOR_HTTP_STATUSES: dict[str, set[int]] = {
 }
 
 ALLOW_EMPTY_BODY_VALIDATORS = {"payment_probe", "x402"}
+
+
+def extract_retry_after_seconds(fetch: FetchResponse) -> int | None:
+    raw_value = fetch.headers.get("retry-after")
+    if not isinstance(raw_value, str):
+        return None
+
+    cleaned = raw_value.strip()
+    if not cleaned:
+        return None
+
+    if cleaned.isdigit():
+        try:
+            return max(int(cleaned), 0)
+        except ValueError:
+            return None
+
+    try:
+        retry_after_at = parsedate_to_datetime(cleaned)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    if retry_after_at.tzinfo is None:
+        return None
+    try:
+        seconds = int(retry_after_at.timestamp() - datetime.now(timezone.utc).timestamp())
+    except (OverflowError, OSError):
+        return None
+    return max(seconds, 0)
 
 
 def merge_ucp_facts(primary: dict[str, Any], enriched: dict[str, Any]) -> dict[str, Any]:
@@ -79,6 +109,26 @@ def build_outcome(
             byte_count=fetch.byte_count,
             body_sha256=fetch.body_sha256,
             detail="404 not found",
+        )
+
+    if fetch.status == 429:
+        retry_after_seconds = extract_retry_after_seconds(fetch)
+        facts: dict[str, Any] = {}
+        detail = "HTTP 429"
+        if retry_after_seconds is not None:
+            facts["retry_after_seconds"] = retry_after_seconds
+            detail = f"HTTP 429 (Retry-After: {retry_after_seconds}s)"
+        return ProbeOutcome(
+            key=spec.key,
+            path=spec.path,
+            status="rate_limited",
+            http_status=fetch.status,
+            content_type=fetch.content_type,
+            final_url=fetch.final_url,
+            byte_count=fetch.byte_count,
+            body_sha256=fetch.body_sha256,
+            detail=detail,
+            facts=facts,
         )
 
     if fetch.status is None and fetch.error:

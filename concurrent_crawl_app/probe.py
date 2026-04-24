@@ -16,6 +16,8 @@ from .validators_content import validate_ucp
 
 STORED_ARTIFACT_KEYS = frozenset({"robots_txt", "llms_txt", "llms_full_txt"})
 RETRYABLE_FETCH_ERRORS = frozenset({"timeout", "url_error:timed out"})
+LIGHTWEIGHT_BASE_PROBE_KEYS = frozenset({"robots_txt", "sitemap_xml", "llms_txt", "llms_full_txt"})
+RATE_LIMIT_SKIP_THRESHOLD = 3
 
 
 def finalize_receipt(
@@ -124,6 +126,80 @@ def fetch_with_retry(
             content_type=content_type,
         )
     return fetch
+
+
+def count_rate_limited_outcomes(outcomes: dict[str, ProbeOutcome]) -> int:
+    return sum(1 for outcome in outcomes.values() if outcome.status == "rate_limited")
+
+
+def count_valid_surface_outcomes(outcomes: dict[str, ProbeOutcome]) -> int:
+    return sum(
+        1
+        for key, outcome in outcomes.items()
+        if key not in {"homepage", "robots_txt", "sitemap_xml"} and outcome.status == "valid"
+    )
+
+
+def rate_limit_backoff_seconds(domain: str, hit_count: int) -> float:
+    jitter = (sum(domain.encode("utf-8")) % 250) / 1000.0
+    return min(3.0, 0.75 + (max(hit_count, 1) - 1) * 0.5 + jitter)
+
+
+def maybe_backoff_after_rate_limit(domain: str, outcomes: dict[str, ProbeOutcome]) -> None:
+    hit_count = count_rate_limited_outcomes(outcomes)
+    if hit_count <= 0:
+        return
+    time.sleep(rate_limit_backoff_seconds(domain, hit_count))
+
+
+def mark_probe_specs_skipped(
+    outcomes: dict[str, ProbeOutcome],
+    specs: list[ProbeSpec],
+    *,
+    detail: str,
+) -> None:
+    for spec in specs:
+        outcomes.setdefault(
+            spec.key,
+            ProbeOutcome(
+                key=spec.key,
+                path=spec.path,
+                status="skipped",
+                http_status=None,
+                content_type=None,
+                detail=detail,
+            ),
+        )
+
+
+def mark_followup_probes_skipped(
+    outcomes: dict[str, ProbeOutcome],
+    *,
+    detail: str,
+) -> None:
+    for spec in (PRODUCTS_PROBE, CART_PROBE):
+        outcomes.setdefault(
+            spec.key,
+            ProbeOutcome(
+                key=spec.key,
+                path=spec.path,
+                status="skipped",
+                http_status=None,
+                content_type=None,
+                detail=detail,
+            ),
+        )
+    outcomes.setdefault(
+        "payment_probe",
+        ProbeOutcome(
+            key="payment_probe",
+            path="dynamic",
+            status="skipped",
+            http_status=None,
+            content_type=None,
+            detail=detail,
+        ),
+    )
 
 
 def build_payment_probe_body(candidate: dict[str, object]) -> bytes | None:
@@ -512,20 +588,10 @@ def probe_domain(
     started_at = time.monotonic()
 
     homepage_spec = next(spec for spec in BASE_PROBES if spec.key == "homepage")
-    other_specs = [spec for spec in BASE_PROBES if spec.key != "homepage"]
+    lightweight_specs = [spec for spec in BASE_PROBES if spec.key in LIGHTWEIGHT_BASE_PROBE_KEYS]
+    discovery_specs = [spec for spec in BASE_PROBES if spec.key not in LIGHTWEIGHT_BASE_PROBE_KEYS and spec.key != "homepage"]
 
-    # Crawl cheap crawl/AI/discovery docs first so a slow homepage does not zero out the receipt.
-    for spec in other_specs:
-        timeout_receipt = maybe_abort_for_wall_clock(
-            domain_input,
-            outcomes,
-            artifacts,
-            started_at=started_at,
-            wall_clock_limit=wall_clock_limit,
-            detail="Skipped after per-domain wall-clock limit was reached before base probe fetches completed",
-        )
-        if timeout_receipt is not None:
-            return timeout_receipt
+    def probe_base_spec(spec: ProbeSpec) -> None:
         fetch = fetch_with_retry(
             f"https://{domain}{spec.path}",
             timeout=timeout,
@@ -543,6 +609,32 @@ def probe_domain(
             and fetch.body
         ):
             artifacts[spec.key] = fetch.body
+        if outcome.status == "rate_limited":
+            maybe_backoff_after_rate_limit(domain, outcomes)
+
+    # Crawl cheap crawl/AI docs first so a slow homepage or WAF does not zero out the receipt.
+    for index, spec in enumerate(lightweight_specs):
+        timeout_receipt = maybe_abort_for_wall_clock(
+            domain_input,
+            outcomes,
+            artifacts,
+            started_at=started_at,
+            wall_clock_limit=wall_clock_limit,
+            detail="Skipped after per-domain wall-clock limit was reached before base probe fetches completed",
+        )
+        if timeout_receipt is not None:
+            return timeout_receipt
+        probe_base_spec(spec)
+        if (
+            count_rate_limited_outcomes(outcomes) >= RATE_LIMIT_SKIP_THRESHOLD
+            and count_valid_surface_outcomes(outcomes) == 0
+        ):
+            mark_probe_specs_skipped(
+                outcomes,
+                lightweight_specs[index + 1:] + discovery_specs,
+                detail="Skipped after repeated HTTP 429 responses during early discovery probes",
+            )
+            break
 
     timeout_receipt = maybe_abort_for_wall_clock(
         domain_input,
@@ -577,6 +669,63 @@ def probe_domain(
     )
     homepage_outcome = build_outcome(homepage_spec, homepage_fetch)
     outcomes[homepage_spec.key] = homepage_outcome
+    if homepage_outcome.status == "rate_limited":
+        maybe_backoff_after_rate_limit(domain, outcomes)
+
+    if (
+        not any(spec.key in outcomes for spec in discovery_specs)
+        and (
+            homepage_outcome.status == "rate_limited"
+            or count_rate_limited_outcomes(outcomes) >= RATE_LIMIT_SKIP_THRESHOLD
+        )
+        and count_valid_surface_outcomes(outcomes) == 0
+    ):
+        mark_followup_probes_skipped(
+            outcomes,
+            detail="Skipped after repeated HTTP 429 responses without any valid machine-readable surface",
+        )
+        return finalize_receipt(
+            domain_input,
+            outcomes,
+            artifacts,
+            started_at=started_at,
+            wall_clock_limit=wall_clock_limit,
+        )
+
+    for index, spec in enumerate(discovery_specs):
+        if spec.key in outcomes:
+            continue
+        timeout_receipt = maybe_abort_for_wall_clock(
+            domain_input,
+            outcomes,
+            artifacts,
+            started_at=started_at,
+            wall_clock_limit=wall_clock_limit,
+            detail="Skipped after per-domain wall-clock limit was reached before discovery probe fetches completed",
+        )
+        if timeout_receipt is not None:
+            return timeout_receipt
+        probe_base_spec(spec)
+        if (
+            count_rate_limited_outcomes(outcomes) >= RATE_LIMIT_SKIP_THRESHOLD
+            and count_valid_surface_outcomes(outcomes) == 0
+        ):
+            mark_probe_specs_skipped(
+                outcomes,
+                discovery_specs[index + 1:],
+                detail="Skipped after repeated HTTP 429 responses during discovery probes",
+            )
+            mark_followup_probes_skipped(
+                outcomes,
+                detail="Skipped after repeated HTTP 429 responses during discovery probes",
+            )
+            return finalize_receipt(
+                domain_input,
+                outcomes,
+                artifacts,
+                started_at=started_at,
+                wall_clock_limit=wall_clock_limit,
+            )
 
     root_ucp_outcome = outcomes.get("well_known_ucp")
     if root_ucp_outcome and root_ucp_outcome.status == "valid":
