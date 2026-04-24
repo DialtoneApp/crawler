@@ -33,6 +33,7 @@
   - `positives/<domain>.json`
 - Replaced the single append-only receipt log with rotated receipt shards under `results/receipts/`.
 - Added shard-aware checkpoint state so resume continues from the active shard instead of assuming one giant file.
+- Added `KeyboardInterrupt` handling so `Ctrl-C` writes a checkpoint immediately instead of only at the next periodic checkpoint boundary.
 - Increased byte caps for `openapi.json` and `products.json` so large but real documents are less likely to be misclassified as invalid.
 - Reworked checkpoint progress tracking so the next row index is tracked explicitly instead of depending on the last loop variable.
 
@@ -41,6 +42,12 @@
 - `results/receipts/receipt-000001.ndjson` and later shards: compact receipt lines for all crawled domains
 - `results/checkpoint.json`: explicit resume state
 - `results/positives/*.json`: expanded JSON for interesting domains
+
+### Checkpoint behavior
+
+- Periodic checkpoints happen every `--checkpoint-every` completed domains.
+- The default is still `100`.
+- `Ctrl-C` now forces an immediate checkpoint with the latest completed row index, counts, and active shard state.
 
 ### Still to do
 

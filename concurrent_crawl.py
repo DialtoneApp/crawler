@@ -1227,14 +1227,17 @@ def crawl(args: argparse.Namespace) -> int:
     futures: dict[Future[CrawlReceipt], DomainInput] = {}
     run_token = hex(int(started_at * 1_000_000))[2:]
     last_completed_row_index = start_row_index
-
-    with ReceiptShardWriter(
+    interrupted = False
+    receipt_writer = ReceiptShardWriter(
         receipts_dir,
         max_bytes=args.receipt_shard_max_bytes,
         max_records=args.receipt_shard_max_records,
         initial_state=receipt_shard_state,
-    ) as receipt_writer:
-        with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
+    )
+    executor = ThreadPoolExecutor(max_workers=args.concurrency)
+
+    try:
+        with receipt_writer:
             for _ in range(args.concurrency):
                 if not submit_next(executor, futures, domains, args.timeout, run_token):
                     break
@@ -1306,24 +1309,35 @@ def crawl(args: argparse.Namespace) -> int:
                         )
 
                     submit_next(executor, futures, domains, args.timeout, run_token)
+    except KeyboardInterrupt:
+        interrupted = True
+        print(
+            f"interrupt received; writing checkpoint at row_index={last_completed_row_index} completed={completed} found={found}",
+            file=sys.stderr,
+        )
+    finally:
+        for future in futures:
+            future.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
+        receipt_writer.flush()
+        write_checkpoint(
+            checkpoint_path,
+            build_checkpoint_payload(
+                completed=completed,
+                found=found,
+                next_row_index=last_completed_row_index,
+                started_at=started_at,
+                label_counts=label_counts,
+                probe_status_counts=probe_status_counts,
+                receipt_shard=receipt_writer.snapshot(),
+            ),
+        )
 
-    write_checkpoint(
-        checkpoint_path,
-        build_checkpoint_payload(
-            completed=completed,
-            found=found,
-            next_row_index=last_completed_row_index,
-            started_at=started_at,
-            label_counts=label_counts,
-            probe_status_counts=probe_status_counts,
-            receipt_shard=receipt_writer.snapshot(),
-        ),
-    )
     print(
-        f"done completed={completed} found={found} shard=receipt-{receipt_writer.state.shard_index:06d} labels={dict(label_counts.most_common())}",
+        f"{'interrupted' if interrupted else 'done'} completed={completed} found={found} shard=receipt-{receipt_writer.state.shard_index:06d} labels={dict(label_counts.most_common())}",
         file=sys.stderr,
     )
-    return 0
+    return 130 if interrupted else 0
 
 
 def main() -> int:
