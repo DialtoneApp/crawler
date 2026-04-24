@@ -10,10 +10,12 @@ from .helpers import (
     extract_observed_json_schema_facts,
     extract_template_parameters,
     extract_title,
+    final_host,
     is_generic_error_fallback_body,
     is_html_content_type,
     is_json_content_type,
     is_login_handoff_body,
+    looks_like_browser_checkout_url,
     looks_like_html_fragment,
     looks_like_markup_fragment,
     merge_unique_limited,
@@ -602,6 +604,7 @@ def validate_x402(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
 def validate_payment_probe(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
     payment_required_header = fetch.headers.get("payment-required") or fetch.headers.get("x-payment-required")
     www_authenticate_header = fetch.headers.get("www-authenticate")
+    redirect_location = fetch.headers.get("location")
     text = decode_body(fetch.body).strip() if fetch.body else ""
     lower_text = text.lower()
     header_payment_hints = collect_payment_hints(www_authenticate_header) if isinstance(www_authenticate_header, str) and www_authenticate_header.strip() else {}
@@ -613,6 +616,8 @@ def validate_payment_probe(fetch: FetchResponse) -> tuple[bool, str, dict[str, A
         "payment_required_header_present": bool(payment_required_header),
         "www_authenticate_present": bool(www_authenticate_header),
     }
+    if isinstance(redirect_location, str) and redirect_location.strip():
+        facts["redirect_location"] = redirect_location.strip()
     merged_header_provider_hints = merge_unique_limited(
         header_payment_hints.get("payment_provider_hints", []) if isinstance(header_payment_hints.get("payment_provider_hints"), list) else [],
         payment_required_hints.get("payment_provider_hints", []) if isinstance(payment_required_hints.get("payment_provider_hints"), list) else [],
@@ -668,6 +673,26 @@ def validate_payment_probe(fetch: FetchResponse) -> tuple[bool, str, dict[str, A
                 facts["response_keys"] = sorted(str(key) for key in payload.keys())[:12]
         return True, "Payment challenge returned", facts
 
+    if fetch.status in {301, 302, 303, 307, 308}:
+        redirect_targets = [
+            value
+            for value in (redirect_location, fetch.final_url, fetch.requested_url)
+            if isinstance(value, str) and value.strip()
+        ]
+        redirect_checkout = any(looks_like_browser_checkout_url(value) for value in redirect_targets)
+        redirect_host = next((final_host(value) for value in redirect_targets if final_host(value)), None)
+        if redirect_host:
+            facts["payment_endpoint_hosts"] = merge_unique_limited(
+                facts.get("payment_endpoint_hosts", []) if isinstance(facts.get("payment_endpoint_hosts"), list) else [],
+                [redirect_host],
+                limit=12,
+            )
+        if redirect_checkout:
+            facts["probe_result"] = "browser_checkout_redirect"
+            return True, "Action request redirected into a browser checkout flow", facts
+        facts["probe_result"] = "redirect_boundary"
+        return False, "Action request redirected before a machine-readable payment boundary could be observed", facts
+
     looks_like_html_document = (
         is_html_content_type(fetch.content_type)
         or looks_like_html_fragment(text)
@@ -679,6 +704,24 @@ def validate_payment_probe(fetch: FetchResponse) -> tuple[bool, str, dict[str, A
         or "<meta " in lower_text
     )
     if fetch.status == 200:
+        if looks_like_html_document and (
+            looks_like_browser_checkout_url(fetch.requested_url)
+            or looks_like_browser_checkout_url(fetch.final_url)
+        ):
+            facts["probe_result"] = "browser_checkout_handoff"
+            if text:
+                facts["response_char_count"] = len(text)
+                title = extract_title(text)
+                if title:
+                    facts["response_title"] = title
+            redirect_host = final_host(fetch.final_url) or final_host(fetch.requested_url)
+            if redirect_host:
+                facts["payment_endpoint_hosts"] = merge_unique_limited(
+                    facts.get("payment_endpoint_hosts", []) if isinstance(facts.get("payment_endpoint_hosts"), list) else [],
+                    [redirect_host],
+                    limit=12,
+                )
+            return True, "Action request reached a browser checkout handoff page", facts
         if looks_like_html_document:
             facts["probe_result"] = "html_landing_page"
             if text:

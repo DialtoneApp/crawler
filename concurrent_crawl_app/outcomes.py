@@ -15,7 +15,7 @@ from .validation import VALIDATORS
 
 VALIDATOR_HTTP_STATUSES: dict[str, set[int]] = {
     "commerce": {200, 402},
-    "payment_probe": {200, 400, 401, 402, 403, 405, 409, 422, 429, 503},
+    "payment_probe": {200, 301, 302, 303, 307, 308, 400, 401, 402, 403, 405, 409, 422, 429, 503},
     "x402": {200, 402},
 }
 

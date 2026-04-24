@@ -174,6 +174,24 @@ def derive_x402_discovery_url(base_url: str | None) -> str | None:
     return derive_well_known_url(base_url, "/.well-known/x402.json")
 
 
+def looks_like_browser_checkout_url(value: str | None) -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return False
+    lowered = value.strip().lower()
+    if "shop.app/checkout/" in lowered:
+        return True
+    markers = (
+        "/checkouts/",
+        "/checkout",
+        "/cart/",
+        "cart_link_id=",
+        "redirect_source=checkout",
+        "shop_pay_callback",
+        "skip_shop_pay=",
+    )
+    return any(marker in lowered for marker in markers)
+
+
 def decode_json_like_header(value: str | None) -> Any | None:
     if not isinstance(value, str):
         return None

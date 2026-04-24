@@ -207,6 +207,15 @@ def probe_ucp_catalog_products(
             facts["catalog_source"] = "ucp_search_catalog"
             facts["catalog_query"] = query
             facts["catalog_endpoint"] = endpoint
+            if isinstance(facts.get("payment_probe_candidates"), list):
+                updated_candidates: list[dict[str, Any]] = []
+                for candidate in facts["payment_probe_candidates"]:
+                    if not isinstance(candidate, dict):
+                        continue
+                    updated_candidate = dict(candidate)
+                    updated_candidate["source"] = "ucp_catalog_checkout"
+                    updated_candidates.append(updated_candidate)
+                facts["payment_probe_candidates"] = updated_candidates
 
             outcome = ProbeOutcome(
                 key="api_products",

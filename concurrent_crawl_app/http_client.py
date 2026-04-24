@@ -5,11 +5,16 @@ import json
 import ssl
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 from .constants import CONTROL_PATH_TEMPLATES, DEFAULT_ACCEPT, USER_AGENT
 from .helpers import normalize_content_type
 from .models import FetchResponse
+
+
+class NoRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 def parse_json_body(fetch: FetchResponse) -> Any:
@@ -52,6 +57,7 @@ def fetch_url(
     body: bytes | None = None,
     content_type: str | None = None,
     extra_headers: dict[str, str] | None = None,
+    follow_redirects: bool = True,
 ) -> FetchResponse:
     headers = {
         "Accept": DEFAULT_ACCEPT,
@@ -70,7 +76,9 @@ def fetch_url(
     )
 
     try:
-        with urlopen(request, timeout=timeout) as response:
+        opener = None if follow_redirects else build_opener(NoRedirectHandler())
+        open_fn = urlopen if opener is None else opener.open
+        with open_fn(request, timeout=timeout) as response:
             body, truncated = read_limited(response, max_bytes)
             return FetchResponse(
                 requested_url=url,

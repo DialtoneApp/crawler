@@ -101,6 +101,7 @@ def build_dynamic_probe_outcome(
     method: str = "GET",
     body: bytes | None = None,
     content_type: str | None = None,
+    follow_redirects: bool = True,
 ) -> ProbeOutcome:
     fetch = fetch_with_retry(
         url,
@@ -109,6 +110,7 @@ def build_dynamic_probe_outcome(
         method=method,
         body=body,
         content_type=content_type,
+        follow_redirects=follow_redirects,
     )
     spec = ProbeSpec(key=key, path=url, validator=validator, max_bytes=max_bytes)
     return build_outcome(spec, fetch)
@@ -122,6 +124,7 @@ def fetch_with_retry(
     method: str = "GET",
     body: bytes | None = None,
     content_type: str | None = None,
+    follow_redirects: bool = True,
 ) -> FetchResponse:
     fetch = fetch_url(
         url,
@@ -130,6 +133,7 @@ def fetch_with_retry(
         method=method,
         body=body,
         content_type=content_type,
+        follow_redirects=follow_redirects,
     )
     if fetch.error in RETRYABLE_FETCH_ERRORS and method.upper() in {"GET", "HEAD"}:
         fetch = fetch_url(
@@ -139,6 +143,7 @@ def fetch_with_retry(
             method=method,
             body=body,
             content_type=content_type,
+            follow_redirects=follow_redirects,
         )
     return fetch
 
@@ -282,6 +287,87 @@ def mark_followup_probes_skipped(
     )
 
 
+def merge_payment_probe_candidates(
+    existing: list[dict[str, Any]],
+    additions: list[dict[str, Any]],
+    *,
+    limit: int = 8,
+) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    for value in existing + additions:
+        if not isinstance(value, dict):
+            continue
+        url = value.get("url")
+        url_key = url.strip() if isinstance(url, str) and url.strip() else None
+        if url_key and url_key in seen_urls:
+            continue
+        merged.append(dict(value))
+        if url_key:
+            seen_urls.add(url_key)
+        if len(merged) >= limit:
+            break
+    return merged[:limit]
+
+
+def outcome_has_checkout_enrichment(outcome: ProbeOutcome | None) -> bool:
+    if not outcome or outcome.status != "valid":
+        return False
+    if int(outcome.facts.get("checkout_url_count") or 0) > 0:
+        return True
+    return isinstance(outcome.facts.get("payment_probe_candidates"), list) and len(outcome.facts["payment_probe_candidates"]) > 0
+
+
+def merge_product_checkout_enrichment(
+    target: ProbeOutcome,
+    enrichment: ProbeOutcome,
+) -> ProbeOutcome:
+    merged_facts = dict(target.facts)
+    if int(enrichment.facts.get("checkout_url_count") or 0) > int(merged_facts.get("checkout_url_count") or 0):
+        merged_facts["checkout_url_count"] = int(enrichment.facts.get("checkout_url_count") or 0)
+    if isinstance(enrichment.facts.get("sample_checkout_urls"), list):
+        existing_urls = (
+            merged_facts.get("sample_checkout_urls")
+            if isinstance(merged_facts.get("sample_checkout_urls"), list)
+            else []
+        )
+        merged_urls: list[str] = []
+        seen_urls: set[str] = set()
+        for value in existing_urls + enrichment.facts["sample_checkout_urls"]:
+            if not isinstance(value, str) or not value.strip():
+                continue
+            cleaned = value.strip()
+            if cleaned in seen_urls:
+                continue
+            merged_urls.append(cleaned)
+            seen_urls.add(cleaned)
+            if len(merged_urls) >= 6:
+                break
+        if merged_urls:
+            merged_facts["sample_checkout_urls"] = merged_urls
+    if isinstance(enrichment.facts.get("payment_probe_candidates"), list):
+        merged_facts["payment_probe_candidates"] = merge_payment_probe_candidates(
+            merged_facts.get("payment_probe_candidates") if isinstance(merged_facts.get("payment_probe_candidates"), list) else [],
+            enrichment.facts["payment_probe_candidates"],
+            limit=8,
+        )
+    for key in ("catalog_source", "catalog_query", "catalog_endpoint"):
+        if key in enrichment.facts and key not in merged_facts:
+            merged_facts[key] = enrichment.facts[key]
+    return ProbeOutcome(
+        key=target.key,
+        path=target.path,
+        status=target.status,
+        http_status=target.http_status,
+        content_type=target.content_type,
+        final_url=target.final_url,
+        byte_count=target.byte_count,
+        body_sha256=target.body_sha256,
+        detail=f"{target.detail}; enriched with UCP checkout data",
+        facts=merged_facts,
+    )
+
+
 def build_payment_probe_body(candidate: dict[str, object]) -> bytes | None:
     body = candidate.get("body")
     if body is None:
@@ -329,6 +415,10 @@ def score_payment_probe_candidate(candidate: dict[str, object]) -> int:
             score += 8
         elif source == "x402":
             score += 6
+        elif source == "ucp_catalog_checkout":
+            score += 14
+        elif source == "catalog_checkout":
+            score += 12
     return score
 
 
@@ -337,6 +427,8 @@ def iter_payment_probe_candidates(outcomes: dict[str, ProbeOutcome]):
     for key in (
         "api_openapi_json",
         "openapi_json",
+        "api_products",
+        "products_json",
         "x402_json",
         "x402_well_known",
         "remote_x402",
@@ -979,10 +1071,10 @@ def probe_domain_once(
 
     current_ucp_outcome = outcomes.get("well_known_ucp")
     if (
-        outcomes[PRODUCTS_PROBE.key].status != "valid"
-        and outcomes.get("api_products", ProbeOutcome("", "", "", None, None)).status != "valid"
-        and current_ucp_outcome
+        current_ucp_outcome
         and current_ucp_outcome.status == "valid"
+        and not outcome_has_checkout_enrichment(outcomes.get(PRODUCTS_PROBE.key))
+        and not outcome_has_checkout_enrichment(outcomes.get("api_products"))
     ):
         timeout_receipt = maybe_abort_for_wall_clock(
             domain_input,
@@ -1001,7 +1093,18 @@ def probe_domain_once(
             timeout=timeout,
         )
         if ucp_products_outcome:
-            outcomes["api_products"] = ucp_products_outcome
+            if outcomes.get(PRODUCTS_PROBE.key) and outcomes[PRODUCTS_PROBE.key].status == "valid":
+                outcomes[PRODUCTS_PROBE.key] = merge_product_checkout_enrichment(
+                    outcomes[PRODUCTS_PROBE.key],
+                    ucp_products_outcome,
+                )
+            elif outcomes.get("api_products") and outcomes["api_products"].status == "valid":
+                outcomes["api_products"] = merge_product_checkout_enrichment(
+                    outcomes["api_products"],
+                    ucp_products_outcome,
+                )
+            else:
+                outcomes["api_products"] = ucp_products_outcome
 
     if (
         outcomes[PRODUCTS_PROBE.key].status == "valid"
@@ -1069,6 +1172,7 @@ def probe_domain_once(
         candidate_url = resolved_candidate.get("url")
         candidate_method = resolved_candidate.get("method")
         candidate_content_type = resolved_candidate.get("content_type")
+        candidate_body = build_payment_probe_body(resolved_candidate)
         if isinstance(candidate_url, str) and candidate_url:
             payment_probe_outcome = build_dynamic_probe_outcome(
                 key="payment_probe",
@@ -1077,8 +1181,13 @@ def probe_domain_once(
                 timeout=timeout,
                 max_bytes=65_536,
                 method=candidate_method if isinstance(candidate_method, str) and candidate_method else "GET",
-                body=build_payment_probe_body(resolved_candidate),
-                content_type=candidate_content_type if isinstance(candidate_content_type, str) and candidate_content_type else "application/json",
+                body=candidate_body,
+                content_type=(
+                    candidate_content_type
+                    if isinstance(candidate_content_type, str) and candidate_content_type
+                    else ("application/json" if candidate_body is not None else None)
+                ),
+                follow_redirects=bool(resolved_candidate.get("follow_redirects", True)),
             )
             payment_probe_facts = dict(payment_probe_outcome.facts)
             for fact_key in (
@@ -1091,6 +1200,7 @@ def probe_domain_once(
                 "price_lookup_url",
                 "resolved_from_template",
                 "resolved_parameters",
+                "follow_redirects",
             ):
                 if fact_key in resolved_candidate:
                     payment_probe_facts[f"candidate_{fact_key}"] = resolved_candidate[fact_key]

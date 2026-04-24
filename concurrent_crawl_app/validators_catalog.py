@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from .helpers import merge_unique_limited, normalize_status_value, parse_price
+from .helpers import merge_unique_limited, normalize_status_value, parse_price, resolve_http_url
 from .http_client import parse_json_body
 from .models import FetchResponse
 
@@ -97,6 +97,11 @@ def validate_products(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
     seen_samples: set[tuple[str | None, str | None]] = set()
     preorder_product_count = 0
     stock_statuses: set[str] = set()
+    checkout_url_count = 0
+    sample_checkout_urls: list[str] = []
+    payment_probe_candidates: list[dict[str, Any]] = []
+    seen_payment_probe_urls: set[str] = set()
+    base_reference = fetch.final_url or fetch.requested_url
 
     for product in products:
         if not isinstance(product, dict):
@@ -211,6 +216,35 @@ def validate_products(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
             currency = variant.get("currency") or embedded_currency or product_currency
             if isinstance(currency, str) and currency:
                 currencies.add(currency.upper()[:8])
+            checkout_url = resolve_http_url(base_reference, variant.get("checkout_url"))
+            if checkout_url:
+                checkout_url_count += 1
+                sample_checkout_urls = merge_unique_limited(sample_checkout_urls, [checkout_url], limit=6)
+                if (
+                    checkout_url not in seen_payment_probe_urls
+                    and len(payment_probe_candidates) < 8
+                    and (variant_is_available or variant.get("available") is not False)
+                ):
+                    variant_title = variant.get("title") if isinstance(variant.get("title"), str) and variant.get("title").strip() else None
+                    candidate_title = title[:120] if isinstance(title, str) and title else None
+                    if variant_title and variant_title.lower() != "default title":
+                        candidate_title = f"{candidate_title} - {variant_title[:80]}" if candidate_title else variant_title[:120]
+                    candidate: dict[str, Any] = {
+                        "source": "catalog_checkout",
+                        "url": checkout_url,
+                        "method": "GET",
+                        "follow_redirects": False,
+                    }
+                    if candidate_title:
+                        candidate["title"] = candidate_title
+                    if isinstance(title, str) and title:
+                        candidate["sample_title"] = title[:120]
+                    if price is not None:
+                        candidate["amount"] = str(int(price)) if float(price).is_integer() else str(price)
+                    if isinstance(currency, str) and currency:
+                        candidate["currency"] = currency.upper()[:8]
+                    payment_probe_candidates.append(candidate)
+                    seen_payment_probe_urls.add(checkout_url)
             if price is None:
                 continue
             priced_variant_count += 1
@@ -247,7 +281,7 @@ def validate_products(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
     if product_count == 0:
         return False, "products list did not contain product objects", {}
 
-    return True, "Usable products catalog detected", {
+    facts = {
         "product_count": product_count,
         "variant_count": variant_count,
         "priced_variant_count": priced_variant_count,
@@ -260,6 +294,12 @@ def validate_products(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:
         "preorder_product_count": preorder_product_count,
         "stock_statuses": sorted(stock_statuses)[:12],
     }
+    if checkout_url_count > 0:
+        facts["checkout_url_count"] = checkout_url_count
+        facts["sample_checkout_urls"] = sample_checkout_urls
+    if payment_probe_candidates:
+        facts["payment_probe_candidates"] = payment_probe_candidates
+    return True, "Usable products catalog detected", facts
 
 
 def validate_cart(fetch: FetchResponse) -> tuple[bool, str, dict[str, Any]]:

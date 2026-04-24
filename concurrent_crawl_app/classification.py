@@ -107,12 +107,15 @@ def infer_purchase_boundary(
     products: ProbeOutcome | None,
     commerce: ProbeOutcome | None,
     payment_probe: ProbeOutcome | None,
+    browser_checkout_surface: bool,
 ) -> str:
     probe_result = payment_probe.facts.get("probe_result") if payment_probe and payment_probe.status == "valid" else None
     if probe_result == "payment_challenge":
         return "payment_challenge"
     if probe_result == "success_without_payment":
         return "optional_or_prepaid_payment"
+    if probe_result in {"browser_checkout_redirect", "browser_checkout_handoff"}:
+        return "checkout_redirect"
     if probe_result == "auth_or_method_boundary":
         return "auth_boundary"
     if probe_result == "input_validation":
@@ -129,6 +132,11 @@ def infer_purchase_boundary(
         if priced_offer_count > 0:
             return "offer_documented"
 
+    if browser_checkout_surface and (
+        (products and products.status == "valid")
+        or (commerce and commerce.status == "valid")
+    ):
+        return "checkout_redirect"
     if products and products.status == "valid":
         return "catalog_only"
     if "ai_readable" in tags:
@@ -306,7 +314,6 @@ def classify_receipt(
         "x402_json",
         "x402_well_known",
         "remote_x402",
-        "payment_probe",
     } & valid_keys:
         tags.append("callable_surface")
     if {"robots_txt", "sitemap_xml"} <= valid_keys:
@@ -325,6 +332,8 @@ def classify_receipt(
             "sample_titles",
             "preorder_product_count",
             "stock_statuses",
+            "checkout_url_count",
+            "sample_checkout_urls",
         ):
             if key in products.facts:
                 aggregates[key] = products.facts[key]
@@ -348,6 +357,9 @@ def classify_receipt(
                 for item in aggregates["sample_products"]:
                     if isinstance(item, dict) and item.get("min_price") is not None and "currency" not in item:
                         item["currency"] = default_currency
+        if int(products.facts.get("checkout_url_count") or 0) > 0:
+            tags.append("browser_checkout_surface")
+            browser_checkout_surface = True
 
     cart = outcomes.get("cart_json")
     if cart and cart.status == "valid":
@@ -628,6 +640,8 @@ def classify_receipt(
 
     payment_probe = outcomes.get("payment_probe")
     if payment_probe and payment_probe.status == "valid":
+        if payment_probe.facts.get("probe_result") not in {"browser_checkout_redirect", "browser_checkout_handoff"}:
+            tags.append("callable_surface")
         for key in (
             "probe_method",
             "probe_url",
@@ -691,6 +705,9 @@ def classify_receipt(
                     }
                 ],
             )
+        if payment_probe.facts.get("probe_result") in {"browser_checkout_redirect", "browser_checkout_handoff"}:
+            tags.append("browser_checkout_surface")
+            browser_checkout_surface = True
         if payment_probe.facts.get("probe_result") in {"payment_challenge", "success_without_payment"}:
             tags.append("machine_payable")
             tags.append("verified_payment_surface")
@@ -725,6 +742,7 @@ def classify_receipt(
         products=products,
         commerce=commerce,
         payment_probe=payment_probe,
+        browser_checkout_surface=browser_checkout_surface,
     )
     control_boundary = infer_control_boundary(
         payment_surface=payment_surface,
