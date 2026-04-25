@@ -9,7 +9,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from .constants import INTERESTING_PROBE_KEYS
 from .inputs import iter_domains_from_offset, iter_limited, parse_args
@@ -93,6 +93,36 @@ def build_source_progress(
         )
 
     return progress
+
+
+def load_seen_domains_from_receipts(receipts_dir: Path) -> set[str]:
+    seen_domains: set[str] = set()
+    for path in sorted(receipts_dir.glob("receipt-*.ndjson")):
+        try:
+            with path.open(encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    domain = row.get("domain")
+                    if isinstance(domain, str):
+                        normalized = domain.strip().lower()
+                        if normalized:
+                            seen_domains.add(normalized)
+        except OSError:
+            continue
+    return seen_domains
+
+
+def iter_unseen_domains(domains: Iterable[DomainInput], seen_domains: set[str]) -> Iterable[DomainInput]:
+    for domain_input in domains:
+        if domain_input.domain in seen_domains:
+            continue
+        yield domain_input
 
 
 def submit_next(
@@ -361,6 +391,27 @@ def crawl(args) -> int:
     )
     current_source_progress = source_progress.get(source_csv["path"], {}) if checkpoint else {}
     start_row_index = int(current_source_progress.get("next_row_index", 0)) if current_source_progress else 0
+    current_resume_strategy = (
+        str(current_source_progress.get("resume_strategy"))
+        if isinstance(current_source_progress.get("resume_strategy"), str)
+        else "row_index"
+    ) if current_source_progress else "row_index"
+    legacy_source_progress = (
+        source_progress.get(legacy_source_csv["path"], {})
+        if checkpoint and legacy_source_csv and legacy_source_csv["path"] != source_csv["path"]
+        else {}
+    )
+    legacy_next_row_index = int(legacy_source_progress.get("next_row_index", 0)) if legacy_source_progress else 0
+    resume_from_seen_domains = False
+    seen_domains: set[str] = set()
+    if checkpoint and not args.no_resume and legacy_next_row_index > 0:
+        if current_resume_strategy == "seen_domains" or start_row_index < legacy_next_row_index:
+            seen_domains = load_seen_domains_from_receipts(receipts_dir)
+            if seen_domains:
+                resume_from_seen_domains = True
+                if current_resume_strategy != "seen_domains":
+                    start_row_index = 0
+
     completed = int(checkpoint.get("completed", 0)) if checkpoint else 0
     found = int(checkpoint.get("found", 0)) if checkpoint else 0
     label_counts: Counter[str] = Counter(checkpoint.get("label_counts", {})) if checkpoint else Counter()
@@ -373,7 +424,17 @@ def crawl(args) -> int:
     )
 
     if checkpoint and not args.no_resume:
-        if current_source_progress:
+        if resume_from_seen_domains:
+            print(
+                (
+                    f"resuming {source_csv['name']} from row_index={start_row_index} by skipping "
+                    f"{len(seen_domains)} previously recorded domains from receipt shards "
+                    f"(legacy source {legacy_source_csv['name']} row_index={legacy_next_row_index}) "
+                    f"while appending to shard=receipt-{receipt_shard_state.shard_index:06d}"
+                ),
+                file=sys.stderr,
+            )
+        elif current_source_progress:
             print(
                 f"resuming from row_index={start_row_index} completed={completed} found={found} shard=receipt-{receipt_shard_state.shard_index:06d}",
                 file=sys.stderr,
@@ -389,7 +450,9 @@ def crawl(args) -> int:
             file=sys.stderr,
         )
 
-    domains = iter_domains_from_offset(csv_path, start_row_index)
+    domains: Iterable[DomainInput] = iter_domains_from_offset(csv_path, start_row_index)
+    if resume_from_seen_domains:
+        domains = iter_unseen_domains(domains, seen_domains)
     if args.limit is not None:
         domains = iter_limited(domains, args.limit)
 
@@ -497,6 +560,7 @@ def crawl(args) -> int:
                         source_progress[source_csv["path"]] = {
                             "csv_name": source_csv["name"],
                             "next_row_index": last_completed_row_index,
+                            "resume_strategy": "seen_domains" if resume_from_seen_domains else "row_index",
                             "updated_at": datetime.now(timezone.utc).isoformat(),
                         }
                         receipt_writer.flush()
@@ -538,6 +602,7 @@ def crawl(args) -> int:
         source_progress[source_csv["path"]] = {
             "csv_name": source_csv["name"],
             "next_row_index": last_completed_row_index,
+            "resume_strategy": "seen_domains" if resume_from_seen_domains else "row_index",
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
         receipt_writer.flush()
