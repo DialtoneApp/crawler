@@ -1,4 +1,11 @@
-__pycache__
+__pycache__/
 *.db
-top-1m.csv
-results
+*.duckdb
+*.sqlite
+.DS_Store
+.env
+.env.*
+.venv/
+top-*.csv
+top-*.csv.zip
+results*/
