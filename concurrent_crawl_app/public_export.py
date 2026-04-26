@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import hashlib
 import json
 import shutil
 from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
+
+PUBLIC_EXPORT_VERSION = "v1"
+PUBLIC_EXPORT_PREFIX = f"top-sites/{PUBLIC_EXPORT_VERSION}"
+DEFAULT_PAGE_SIZE = 30
+SITEMAP_PAGE_SIZE = 1000
 
 INDEX_FIELDS = [
     "domain",
@@ -119,6 +124,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Delete the output directory before writing fresh export artifacts.",
     )
+    parser.add_argument(
+        "--page-size",
+        type=int,
+        default=DEFAULT_PAGE_SIZE,
+        help="Number of top-site rows per exported page.",
+    )
     return parser.parse_args()
 
 
@@ -138,6 +149,85 @@ def json_text(value: object) -> str:
 
 def domain_prefix(domain: str) -> str:
     return hashlib.sha1(domain.encode("utf-8")).hexdigest()[:2]
+
+
+def public_export_key(*parts: str) -> str:
+    return "/".join([PUBLIC_EXPORT_PREFIX, *[part.strip("/") for part in parts if part]])
+
+
+def document_preview(value: str | None, max_length: int = 180) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = " ".join(line.strip() for line in value.splitlines() if line.strip())
+    normalized = " ".join(normalized.split())
+    if not normalized:
+        return None
+    if len(normalized) <= max_length:
+        return normalized
+    return f"{normalized[: max_length - 3].rstrip()}..."
+
+
+def read_text(path: Path) -> str | None:
+    if not path.exists() or not path.is_file():
+        return None
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def parse_epoch(value: Any) -> int:
+    if not isinstance(value, str) or not value:
+        return 0
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return 0
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return int(parsed.timestamp())
+
+
+def parse_json_list_text(value: Any) -> list[str]:
+    if not isinstance(value, str) or not value:
+        return []
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return []
+    return as_string_list(parsed)
+
+
+def format_label(value: Any) -> str:
+    normalized = str(value or "").strip()
+    return normalized.replace("_", " ") if normalized else "unknown"
+
+
+def summarize_index_row(row: dict[str, Any]) -> str | None:
+    label = format_label(row.get("label"))
+    payment_surface = format_label(row.get("payment_surface")) if row.get("payment_surface") else None
+    purchase_boundary = format_label(row.get("purchase_boundary")) if row.get("purchase_boundary") else None
+    control_boundary = format_label(row.get("control_boundary")) if row.get("control_boundary") else None
+    pieces: list[str] = []
+
+    if label != "unknown":
+        pieces.append(label)
+    if payment_surface:
+        pieces.append(payment_surface)
+    if row.get("score_overall") is not None:
+        pieces.append(f"score {row['score_overall']}")
+    if row.get("product_count"):
+        pieces.append(f"{row['product_count']} products")
+    elif row.get("offer_count"):
+        pieces.append(f"{row['offer_count']} offers")
+    elif row.get("priced_action_count"):
+        pieces.append(f"{row['priced_action_count']} priced actions")
+    if purchase_boundary and purchase_boundary != "unknown":
+        pieces.append(f"purchase {purchase_boundary}")
+    if control_boundary and control_boundary != "unknown":
+        pieces.append(f"control {control_boundary}")
+
+    return " | ".join(pieces) if pieces else None
 
 
 def best_probe(probes: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any] | None:
@@ -299,17 +389,17 @@ def build_r2_keys(domain: str, source_evidence_dir: Path, detail_eligible: bool,
         }
 
     prefix = domain_prefix(domain)
-    receipt_key = f"receipts/v1/{prefix}/{domain}.json"
-    evidence_key = f"evidence/v1/{prefix}/{domain}/proof.json"
+    receipt_key = public_export_key("receipts", prefix, f"{domain}.json")
+    evidence_key = public_export_key("evidence", prefix, domain, "proof.json")
 
     robots_key = None
     llms_key = None
     llms_full_key = None
 
     if (source_evidence_dir / "robots.txt").exists():
-        robots_key = f"evidence/v1/{prefix}/{domain}/robots.txt"
+        robots_key = public_export_key("evidence", prefix, domain, "robots.txt")
     if (source_evidence_dir / "llms.txt").exists():
-        llms_key = f"evidence/v1/{prefix}/{domain}/llms.txt"
+        llms_key = public_export_key("evidence", prefix, domain, "llms.txt")
     llms_full_path = source_evidence_dir / "llms-full.txt"
     if llms_full_path.exists():
         should_export_llms_full = (
@@ -318,7 +408,7 @@ def build_r2_keys(domain: str, source_evidence_dir: Path, detail_eligible: bool,
             or llms_full_path.stat().st_size <= 32_768
         )
         if should_export_llms_full:
-            llms_full_key = f"evidence/v1/{prefix}/{domain}/llms-full.txt"
+            llms_full_key = public_export_key("evidence", prefix, domain, "llms-full.txt")
 
     return {
         "receipt_r2_key": receipt_key,
@@ -348,12 +438,17 @@ def build_public_receipt(
     detail = {
         "domain": domain,
         "canonical_domain": domain,
+        "requested_domain": domain,
         "rank": rank,
         "label": label,
         "title": receipt.get("title"),
         "favicon_url": aggregates.get("favicon_url"),
         "og_image_url": aggregates.get("og_image_url"),
+        "site_url": f"https://{domain}" if domain else None,
+        "homepage_url": f"https://{domain}" if domain else None,
+        "homepage_final_url": f"https://{domain}" if domain else None,
         "crawled_at": receipt.get("crawled_at"),
+        "scanned_at": receipt.get("crawled_at"),
         "tags": tags,
         "scores": scores,
         "boundaries": {
@@ -396,6 +491,7 @@ def build_public_receipt(
         },
         "probe_summary": build_probe_summary(probes),
         "evidence": r2_keys,
+        "source": "top_site_receipt",
     }
 
     index_row = {
@@ -432,7 +528,156 @@ def build_public_receipt(
         "capability_names_json": json_text(detail["capabilities"]),
         **r2_keys,
     }
+    detail["description"] = summarize_index_row(index_row)
     return index_row, detail
+
+
+def canonical_sort_key(index_row: dict[str, Any], detail_eligible: bool) -> tuple[Any, ...]:
+    rank = as_int(index_row.get("rank"))
+    return (
+        int(detail_eligible),
+        int(index_row.get("verified_payment_surface") or 0),
+        as_int(index_row.get("score_overall")) or 0,
+        as_int(index_row.get("score_payment")) or 0,
+        as_int(index_row.get("score_callable")) or 0,
+        as_int(index_row.get("score_commerce")) or 0,
+        parse_epoch(index_row.get("crawled_at")),
+        -(rank if rank is not None else 10**12),
+    )
+
+
+def page_sort_key(item: dict[str, Any]) -> tuple[Any, ...]:
+    row = item["index_row"]
+    return (
+        -(as_int(row.get("score_overall")) or 0),
+        row.get("domain") or "",
+    )
+
+
+def latest_crawled_at(rows: list[dict[str, Any]]) -> str | None:
+    values = [
+        row["index_row"].get("crawled_at")
+        for row in rows
+        if isinstance(row["index_row"].get("crawled_at"), str)
+    ]
+    return max(values) if values else None
+
+
+def build_list_entry(index_row: dict[str, Any], *, list_position: int, source_evidence_dir: Path) -> dict[str, Any]:
+    robots_text = read_text(source_evidence_dir / "robots.txt")
+    llms_text = read_text(source_evidence_dir / "llms.txt")
+    llms_full_text = read_text(source_evidence_dir / "llms-full.txt")
+    domain = index_row.get("domain")
+
+    return {
+        "domain": domain,
+        "canonical_domain": index_row.get("canonical_domain") or domain,
+        "rank": index_row.get("rank"),
+        "list_position": list_position,
+        "label": index_row.get("label") or "no_clear_signal",
+        "title": index_row.get("title") or domain,
+        "favicon_url": index_row.get("favicon_url"),
+        "og_image_url": index_row.get("og_image_url"),
+        "description": summarize_index_row(index_row),
+        "site_url": f"https://{domain}" if domain else None,
+        "robots": document_preview(robots_text),
+        "llms": document_preview(llms_text) or document_preview(llms_full_text),
+        "crawled_at": index_row.get("crawled_at"),
+        "score_overall": index_row.get("score_overall"),
+        "score_readable": index_row.get("score_readable"),
+        "score_callable": index_row.get("score_callable"),
+        "score_commerce": index_row.get("score_commerce"),
+        "score_payment": index_row.get("score_payment"),
+        "payment_surface": index_row.get("payment_surface"),
+        "purchase_boundary": index_row.get("purchase_boundary"),
+        "control_boundary": index_row.get("control_boundary"),
+        "crypto_only": bool(index_row.get("crypto_only")),
+        "verified_payment_surface": bool(index_row.get("verified_payment_surface")),
+        "payment_provider_hints": parse_json_list_text(index_row.get("payment_provider_hints_json")),
+        "payment_rail_hints": parse_json_list_text(index_row.get("payment_rail_hints_json")),
+        "tags": parse_json_list_text(index_row.get("tags_json")),
+    }
+
+
+def write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, separators=(",", ":"), sort_keys=True), encoding="utf-8")
+
+
+def write_pretty_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def write_page_files(output_dir: Path, public_rows: list[dict[str, Any]], page_size: int) -> dict[str, Any]:
+    total = len(public_rows)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    pages_dir = output_dir / public_export_key("pages")
+
+    for page_number in range(1, total_pages + 1):
+        start = (page_number - 1) * page_size
+        page_items = public_rows[start : start + page_size]
+        results = [
+            build_list_entry(
+                item["index_row"],
+                list_position=start + index + 1,
+                source_evidence_dir=item["source_evidence_dir"],
+            )
+            for index, item in enumerate(page_items)
+        ]
+        write_json(
+            pages_dir / f"{page_number:06d}.json",
+            {
+                "pagination": {
+                    "page": page_number,
+                    "pageSize": page_size,
+                    "total": total,
+                    "totalPages": total_pages,
+                },
+                "sort": "score_overall_desc",
+                "results": results,
+            },
+        )
+
+    return {
+        "page_size": page_size,
+        "path_prefix": public_export_key("pages"),
+        "total": total,
+        "total_pages": total_pages,
+    }
+
+
+def write_sitemap_domain_files(output_dir: Path, public_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    total = len(public_rows)
+    total_pages = max(1, (total + SITEMAP_PAGE_SIZE - 1) // SITEMAP_PAGE_SIZE)
+    sitemap_dir = output_dir / public_export_key("sitemaps")
+
+    for page_number in range(1, total_pages + 1):
+        start = (page_number - 1) * SITEMAP_PAGE_SIZE
+        domains = [
+            item["index_row"]["domain"]
+            for item in public_rows[start : start + SITEMAP_PAGE_SIZE]
+            if item["index_row"].get("domain")
+        ]
+        write_json(
+            sitemap_dir / f"{page_number:06d}.json",
+            {
+                "pagination": {
+                    "page": page_number,
+                    "pageSize": SITEMAP_PAGE_SIZE,
+                    "total": total,
+                    "totalPages": total_pages,
+                },
+                "domains": domains,
+            },
+        )
+
+    return {
+        "page_size": SITEMAP_PAGE_SIZE,
+        "path_prefix": public_export_key("sitemaps"),
+        "total": total,
+        "total_pages": total_pages,
+    }
 
 
 def ensure_clean_output(output_dir: Path) -> None:
@@ -486,82 +731,101 @@ def export_public(args: argparse.Namespace) -> int:
         ensure_clean_output(output_dir)
     else:
         output_dir.mkdir(parents=True, exist_ok=True)
-        for child_name in ("d1", "receipts", "evidence", "manifests"):
+        for child_name in ("d1", "receipts", "evidence", "explorer", "top-sites", "manifests"):
             child_path = output_dir / child_name
             if child_path.exists():
                 shutil.rmtree(child_path)
 
-    d1_dir = output_dir / "d1"
-    receipts_out_dir = output_dir / "receipts" / "v1"
     manifests_dir = output_dir / "manifests" / "v1"
-    d1_dir.mkdir(parents=True, exist_ok=True)
-    receipts_out_dir.mkdir(parents=True, exist_ok=True)
     manifests_dir.mkdir(parents=True, exist_ok=True)
 
     positive_domains = {
-        path.stem
+        path.stem.strip().lower()
         for path in positives_dir.glob("*.json")
+        if path.stem.strip()
     }
 
-    latest_receipts: dict[str, dict[str, Any]] = {}
-    label_counts: Counter[str] = Counter()
-    detail_count = 0
+    canonical_receipts: dict[str, dict[str, Any]] = {}
+    raw_receipt_count = 0
 
     for receipt in iter_receipts(receipts_dir):
         domain = str(receipt.get("domain") or "").strip().lower()
         if not domain:
             continue
-        latest_receipts[domain] = receipt
+        raw_receipt_count += 1
 
-    csv_path = d1_dir / "site_receipts.csv"
-    ndjson_path = d1_dir / "site_receipts.ndjson"
-    with (
-        csv_path.open("w", newline="", encoding="utf-8") as csv_handle,
-        ndjson_path.open("w", encoding="utf-8") as ndjson_handle,
-    ):
-        writer = csv.DictWriter(csv_handle, fieldnames=INDEX_FIELDS)
-        writer.writeheader()
-        for domain, receipt in latest_receipts.items():
-            source_evidence_dir = evidence_dir / domain
-            detail_eligible = domain in positive_domains
-            index_row, detail = build_public_receipt(
-                receipt,
-                source_evidence_dir=source_evidence_dir,
-                detail_eligible=detail_eligible,
-            )
-            label_counts[index_row["label"]] += 1
+        source_evidence_dir = evidence_dir / domain
+        detail_eligible = domain in positive_domains
+        index_row, detail = build_public_receipt(
+            receipt,
+            source_evidence_dir=source_evidence_dir,
+            detail_eligible=detail_eligible,
+        )
+        candidate = {
+            "index_row": index_row,
+            "detail": detail,
+            "detail_eligible": detail_eligible,
+            "source_evidence_dir": source_evidence_dir,
+            "canonical_key": canonical_sort_key(index_row, detail_eligible),
+        }
+        existing = canonical_receipts.get(domain)
+        if existing is None or candidate["canonical_key"] > existing["canonical_key"]:
+            canonical_receipts[domain] = candidate
 
-            writer.writerow({field: index_row.get(field) for field in INDEX_FIELDS})
-            ndjson_handle.write(json.dumps(index_row, separators=(",", ":"), sort_keys=True))
-            ndjson_handle.write("\n")
+    canonical_rows = list(canonical_receipts.values())
+    public_rows = [
+        row
+        for row in canonical_rows
+        if row["detail_eligible"] and row["index_row"].get("receipt_r2_key")
+    ]
+    public_rows.sort(key=page_sort_key)
+    page_size = max(1, int(args.page_size or DEFAULT_PAGE_SIZE))
+    list_manifest = write_page_files(output_dir, public_rows, page_size)
+    sitemap_manifest = write_sitemap_domain_files(output_dir, public_rows)
 
-            if detail_eligible:
-                relative_key = detail["evidence"]["receipt_r2_key"]
-                if isinstance(relative_key, str) and relative_key:
-                    detail_path = output_dir / relative_key
-                    detail_path.parent.mkdir(parents=True, exist_ok=True)
-                    detail_path.write_text(
-                        json.dumps(detail, indent=2, sort_keys=True),
-                        encoding="utf-8",
-                    )
-                    maybe_copy_evidence(source_evidence_dir, output_dir, detail)
-                    detail_count += 1
+    label_counts: Counter[str] = Counter()
+    for item in public_rows:
+        index_row = item["index_row"]
+        detail = item["detail"]
+        label_counts[index_row["label"]] += 1
+        relative_key = detail["evidence"]["receipt_r2_key"]
+        if isinstance(relative_key, str) and relative_key:
+            write_pretty_json(output_dir / relative_key, detail)
+            maybe_copy_evidence(item["source_evidence_dir"], output_dir, detail)
 
     manifest = {
         "version": 1,
-        "receipt_count": len(latest_receipts),
-        "detail_receipt_count": detail_count,
+        "export_version": PUBLIC_EXPORT_VERSION,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "sort": "score_overall_desc",
+        "raw_receipt_count": raw_receipt_count,
+        "total_rows": len(canonical_rows),
+        "public_receipt_rows": len(public_rows),
+        "latest_crawled_at": latest_crawled_at(public_rows),
         "label_counts": dict(sorted(label_counts.items())),
+        "pages": list_manifest,
+        "sitemaps": sitemap_manifest,
         "paths": {
-            "site_receipts_csv": str(csv_path.relative_to(output_dir)),
-            "site_receipts_ndjson": str(ndjson_path.relative_to(output_dir)),
-            "receipt_prefix": "receipts/v1/",
-            "manifest": "manifests/v1/latest.json",
+            "manifest": public_export_key("manifest.json"),
+            "page_prefix": public_export_key("pages"),
+            "receipt_prefix": public_export_key("receipts"),
+            "evidence_prefix": public_export_key("evidence"),
+            "sitemap_prefix": public_export_key("sitemaps"),
+            "latest_manifest": "manifests/v1/latest.json",
         },
     }
-    (manifests_dir / "latest.json").write_text(
-        json.dumps(manifest, indent=2, sort_keys=True),
-        encoding="utf-8",
+    write_pretty_json(output_dir / public_export_key("manifest.json"), manifest)
+    write_pretty_json(
+        manifests_dir / "latest.json",
+        {
+            "version": 1,
+            "export_version": PUBLIC_EXPORT_VERSION,
+            "generated_at": manifest["generated_at"],
+            "top_sites_manifest": public_export_key("manifest.json"),
+            "manifest": "manifests/v1/latest.json",
+            "total_rows": manifest["total_rows"],
+            "public_receipt_rows": manifest["public_receipt_rows"],
+        },
     )
     return 0
 
