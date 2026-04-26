@@ -11,6 +11,9 @@ from typing import Any, Iterable
 
 PUBLIC_EXPORT_VERSION = "v1"
 PUBLIC_EXPORT_PREFIX = f"top-sites/{PUBLIC_EXPORT_VERSION}"
+DETAIL_RECEIPT_PREFIX = "receipts/v1"
+DETAIL_EVIDENCE_PREFIX = "evidence/v1"
+TOP_SITE_SITEMAP_PREFIX = f"sitemaps/top-sites/{PUBLIC_EXPORT_VERSION}"
 DEFAULT_PAGE_SIZE = 30
 SITEMAP_PAGE_SIZE = 1000
 
@@ -153,6 +156,10 @@ def domain_prefix(domain: str) -> str:
 
 def public_export_key(*parts: str) -> str:
     return "/".join([PUBLIC_EXPORT_PREFIX, *[part.strip("/") for part in parts if part]])
+
+
+def prefixed_key(prefix: str, *parts: str) -> str:
+    return "/".join([prefix.strip("/"), *[part.strip("/") for part in parts if part]])
 
 
 def document_preview(value: str | None, max_length: int = 180) -> str | None:
@@ -386,20 +393,20 @@ def build_r2_keys(domain: str, source_evidence_dir: Path, detail_eligible: bool,
             "robots_r2_key": None,
             "llms_r2_key": None,
             "llms_full_r2_key": None,
-        }
+    }
 
     prefix = domain_prefix(domain)
-    receipt_key = public_export_key("receipts", prefix, f"{domain}.json")
-    evidence_key = public_export_key("evidence", prefix, domain, "proof.json")
+    receipt_key = prefixed_key(DETAIL_RECEIPT_PREFIX, prefix, f"{domain}.json")
+    evidence_key = prefixed_key(DETAIL_EVIDENCE_PREFIX, prefix, domain, "proof.json")
 
     robots_key = None
     llms_key = None
     llms_full_key = None
 
     if (source_evidence_dir / "robots.txt").exists():
-        robots_key = public_export_key("evidence", prefix, domain, "robots.txt")
+        robots_key = prefixed_key(DETAIL_EVIDENCE_PREFIX, prefix, domain, "robots.txt")
     if (source_evidence_dir / "llms.txt").exists():
-        llms_key = public_export_key("evidence", prefix, domain, "llms.txt")
+        llms_key = prefixed_key(DETAIL_EVIDENCE_PREFIX, prefix, domain, "llms.txt")
     llms_full_path = source_evidence_dir / "llms-full.txt"
     if llms_full_path.exists():
         should_export_llms_full = (
@@ -408,7 +415,7 @@ def build_r2_keys(domain: str, source_evidence_dir: Path, detail_eligible: bool,
             or llms_full_path.stat().st_size <= 32_768
         )
         if should_export_llms_full:
-            llms_full_key = public_export_key("evidence", prefix, domain, "llms-full.txt")
+            llms_full_key = prefixed_key(DETAIL_EVIDENCE_PREFIX, prefix, domain, "llms-full.txt")
 
     return {
         "receipt_r2_key": receipt_key,
@@ -650,7 +657,7 @@ def write_page_files(output_dir: Path, public_rows: list[dict[str, Any]], page_s
 def write_sitemap_domain_files(output_dir: Path, public_rows: list[dict[str, Any]]) -> dict[str, Any]:
     total = len(public_rows)
     total_pages = max(1, (total + SITEMAP_PAGE_SIZE - 1) // SITEMAP_PAGE_SIZE)
-    sitemap_dir = output_dir / public_export_key("sitemaps")
+    sitemap_dir = output_dir / TOP_SITE_SITEMAP_PREFIX
 
     for page_number in range(1, total_pages + 1):
         start = (page_number - 1) * SITEMAP_PAGE_SIZE
@@ -674,7 +681,7 @@ def write_sitemap_domain_files(output_dir: Path, public_rows: list[dict[str, Any
 
     return {
         "page_size": SITEMAP_PAGE_SIZE,
-        "path_prefix": public_export_key("sitemaps"),
+        "path_prefix": TOP_SITE_SITEMAP_PREFIX,
         "total": total,
         "total_pages": total_pages,
     }
@@ -808,9 +815,9 @@ def export_public(args: argparse.Namespace) -> int:
         "paths": {
             "manifest": public_export_key("manifest.json"),
             "page_prefix": public_export_key("pages"),
-            "receipt_prefix": public_export_key("receipts"),
-            "evidence_prefix": public_export_key("evidence"),
-            "sitemap_prefix": public_export_key("sitemaps"),
+            "receipt_prefix": DETAIL_RECEIPT_PREFIX,
+            "evidence_prefix": DETAIL_EVIDENCE_PREFIX,
+            "sitemap_prefix": TOP_SITE_SITEMAP_PREFIX,
             "latest_manifest": "manifests/v1/latest.json",
         },
     }
